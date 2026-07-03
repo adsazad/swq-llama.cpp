@@ -326,11 +326,11 @@ to Q8_0 while remaining above the speed target. Applying SWQ to all attention
 tensors saved more memory but dropped generation below the target.
 
 ```mermaid
-xychart-beta
-    title "Generation speed for primary runtime formats"
-    x-axis [FP16, Q8_0, SWQ128, Q8_SWQ_KV, Q8_SWQ_ATTN]
-    y-axis "tokens/sec" 0 --> 18
-    bar [16.9, 16.4, 2.8, 14.9, 8.0]
+flowchart LR
+    A["FP16: 16.9 t/s"] --> B["Q8_0: 16.4 t/s"]
+    B --> C["Q8_0 + SWQ K/V: 14.9 t/s"]
+    C --> D["Q8_0 + SWQ attention: 8.0 t/s"]
+    D --> E["Full SWQ128: 2.8 t/s"]
 ```
 
 ### 7.6 Full Q_SWQ_FIT_2
@@ -375,19 +375,19 @@ conversion time searching for coefficients and residual assignments.
 | 144x4 | 862.09 s | 0.334946 | 0.389966 | 0.941987 | Not rerun; same accuracy |
 
 ```mermaid
-xychart-beta
-    title "FIT_2 reconstruction error plateaus with more epochs"
-    x-axis [Initial, 6x2, 24x4, 72x4, 144x4]
-    y-axis "mean relative RMSE" 0.30 --> 0.38
-    line [0.365959, 0.336538, 0.334946, 0.334946, 0.334946]
+flowchart LR
+    A["Initial: 0.365959 RMSE"] --> B["6x2: 0.336538"]
+    B --> C["24x4: 0.334946"]
+    C --> D["72x4: 0.334946"]
+    D --> E["144x4: 0.334946"]
 ```
 
 ```mermaid
-xychart-beta
-    title "FIT_2 conversion cost rises after accuracy stops improving"
-    x-axis [Initial, 6x2, 24x4, 72x4, 144x4]
-    y-axis "seconds" 0 --> 900
-    bar [5.47, 22.52, 110.90, 484.64, 862.09]
+flowchart LR
+    A["Initial: 5.47 s"] --> B["6x2: 22.52 s"]
+    B --> C["24x4: 110.90 s"]
+    C --> D["72x4: 484.64 s"]
+    D --> E["144x4: 862.09 s"]
 ```
 
 The practical convergence point was reached by 24x4. The 72x4 and 144x4 runs
@@ -418,19 +418,15 @@ The offline sweep compared the same cubic predictor with 2-bit, 3-bit, and
 | FIT_4 | 715,739,136 | 290,769,024 | 2.462x | 59.38% | 0.078962 |
 
 ```mermaid
-xychart-beta
-    title "Estimated compression versus residual width"
-    x-axis [FIT_2, FIT_3, FIT_4]
-    y-axis "percent saved" 0 --> 90
-    bar [81.25, 71.88, 59.38]
+flowchart LR
+    A["FIT_2: 81.25% saved"] --> B["FIT_3: 71.88% saved"]
+    B --> C["FIT_4: 59.38% saved"]
 ```
 
 ```mermaid
-xychart-beta
-    title "Reconstruction error versus residual width"
-    x-axis [FIT_2, FIT_3, FIT_4]
-    y-axis "relative RMSE" 0 --> 0.45
-    bar [0.398676, 0.169957, 0.078962]
+flowchart LR
+    A["FIT_2 RMSE: 0.398676"] --> B["FIT_3 RMSE: 0.169957"]
+    B --> C["FIT_4 RMSE: 0.078962"]
 ```
 
 FIT_3 offered the most relevant tradeoff for a target near 70% savings. FIT_4
@@ -509,27 +505,17 @@ the 256-weight hierarchical experiment.
 | Arithmetic generation | 2.52 t/s | 2.71 t/s |
 
 ```mermaid
-xychart-beta
-    title "HFIT4 mixed-profile storage"
-    x-axis [HFIT4_all, Mixed]
-    y-axis "MiB" 0 --> 650
-    bar [556.08, 572.55]
-```
-
-```mermaid
-xychart-beta
-    title "HFIT4 mixed-profile peak RSS"
-    x-axis [HFIT4_all, Mixed]
-    y-axis "MB" 0 --> 900
-    bar [787.9, 793.2]
-```
-
-```mermaid
-xychart-beta
-    title "HFIT4 mixed-profile generation speed"
-    x-axis [HFIT4_fact, Mixed_fact, HFIT4_math, Mixed_math]
-    y-axis "tokens per second" 0 --> 4
-    bar [3.68, 3.67, 2.52, 2.71]
+flowchart LR
+    subgraph A["HFIT4-128 all eligible tensors"]
+        A1["File: 556.08 MiB"] --> A2["Peak RSS: 787.9 MB"]
+        A2 --> A3["Factual: 3.68 t/s"]
+        A3 --> A4["Arithmetic: 2.52 t/s"]
+    end
+    subgraph B["Q8_0 + Q5_0 + HFIT4-128"]
+        B1["File: 572.55 MiB"] --> B2["Peak RSS: 793.2 MB"]
+        B2 --> B3["Factual: 3.67 t/s"]
+        B3 --> B4["Arithmetic: 2.71 t/s"]
+    end
 ```
 
 Both models answered the short factual prompt with New Delhi. Full HFIT4 gave a

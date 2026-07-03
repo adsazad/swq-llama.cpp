@@ -321,27 +321,17 @@ pair used the same 16-token smoke shape; the reasoning pair used the same
 | Longer output | repetitive | unrelated or unstable |
 
 ```mermaid
-xychart-beta
-    title "Model file size"
-    x-axis [HFIT4_all, Mixed]
-    y-axis "MiB" 0 --> 650
-    bar [556.08, 572.55]
-```
-
-```mermaid
-xychart-beta
-    title "Peak resident memory"
-    x-axis [HFIT4_all, Mixed]
-    y-axis "MB" 0 --> 900
-    bar [787.9, 793.2]
-```
-
-```mermaid
-xychart-beta
-    title "Generation speed by prompt"
-    x-axis [HFIT4_factual, Mixed_factual, HFIT4_arithmetic, Mixed_arithmetic]
-    y-axis "tokens per second" 0 --> 4
-    bar [3.68, 3.67, 2.52, 2.71]
+flowchart LR
+    subgraph A["HFIT4-128 all eligible tensors"]
+        A1["File: 556.08 MiB"] --> A2["Peak RSS: 787.9 MB"]
+        A2 --> A3["Factual: 3.68 t/s"]
+        A3 --> A4["Arithmetic: 2.52 t/s"]
+    end
+    subgraph B["Q8_0 + Q5_0 + HFIT4-128"]
+        B1["File: 572.55 MiB"] --> B2["Peak RSS: 793.2 MB"]
+        B2 --> B3["Factual: 3.67 t/s"]
+        B3 --> B4["Arithmetic: 2.71 t/s"]
+    end
 ```
 
 The mixed profile improved arithmetic generation by about 7.5%, but did not
