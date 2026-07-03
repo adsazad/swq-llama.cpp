@@ -30,6 +30,10 @@ void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q4_0_ref(x, y, k);
 }
 
+void quantize_row_q_swq_4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_4_ref(x, y, k);
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }
@@ -119,6 +123,64 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 }
 
 //===================================== Dot products =================================
+
+// Experimental scalar SWQ CPU path. Optimized kernels can replace this after validation.
+void ggml_vec_dot_q_swq_4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_4 == 0);
+    assert(nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_q_swq_4 * x = vx;
+    const float * y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_4; ++i) {
+        for (int j = 0; j < QK_SWQ_4 / 2; ++j) {
+            sum += GGML_CPU_FP16_TO_FP32(x[i].codebook[x[i].qs[j] & 0x0f]) * y[i * QK_SWQ_4 + j];
+            sum += GGML_CPU_FP16_TO_FP32(x[i].codebook[x[i].qs[j] >> 4]) * y[i * QK_SWQ_4 + j + QK_SWQ_4 / 2];
+        }
+    }
+    *s = sum;
+}
+
+// Experimental scalar SWQ x Q8_0 path. Keeps SWQ compressed and fuses decode with dot product.
+void ggml_vec_dot_q_swq_4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_4 == 0);
+    assert(QK_SWQ_4 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_q_swq_4 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_4; ++i) {
+        float cb[QK_SWQ_4 / QK8_0][16];
+        for (int yb = 0; yb < QK_SWQ_4 / QK8_0; ++yb) {
+            const float d = GGML_CPU_FP16_TO_FP32(y[i * (QK_SWQ_4 / QK8_0) + yb].d);
+            for (int k = 0; k < 16; ++k) {
+                cb[yb][k] = d * GGML_CPU_FP16_TO_FP32(x[i].codebook[k]);
+            }
+        }
+
+        for (int j = 0; j < QK_SWQ_4 / 2; ++j) {
+            const int j0 = j;
+            const int j1 = j + QK_SWQ_4 / 2;
+            const uint8_t q = x[i].qs[j];
+            const block_q8_0 * GGML_RESTRICT y0 = y + i * (QK_SWQ_4 / QK8_0) + j0 / QK8_0;
+            const block_q8_0 * GGML_RESTRICT y1 = y + i * (QK_SWQ_4 / QK8_0) + j1 / QK8_0;
+            sum += cb[j0 / QK8_0][q & 0x0f] * y0->qs[j0 % QK8_0];
+            sum += cb[j1 / QK8_0][q >> 4]   * y1->qs[j1 % QK8_0];
+        }
+    }
+
+    *s = sum;
+}
 
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;

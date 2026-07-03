@@ -34,6 +34,7 @@ struct quant_option {
 static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q1_0",     LLAMA_FTYPE_MOSTLY_Q1_0,     " 1.125 bpw quantization",           },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
+    { "Q_SWQ_4",  LLAMA_FTYPE_MOSTLY_Q_SWQ_4,  " experimental 6 bpw block codebook", },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
@@ -121,7 +122,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--swq-stats]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -161,6 +162,8 @@ static void usage(const char * executable) {
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
+    printf("  --swq-stats\n");
+    printf("                                      print detailed experimental SWQ compression statistics\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -442,6 +445,8 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
             params.dry_run = true;
+        } else if (strcmp(argv[arg_idx], "--swq-stats") == 0) {
+            params.swq_stats = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {

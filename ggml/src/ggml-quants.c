@@ -109,6 +109,71 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     }
 }
 
+// Experimental SWQ prototype. Lloyd iterations refine a min/max initialized codebook.
+void quantize_row_q_swq_4_ref(const float * GGML_RESTRICT x, block_q_swq_4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_4 == 0);
+
+    const int nb = k / QK_SWQ_4;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_4;
+        float codebook[16];
+        float min = xb[0];
+        float max = xb[0];
+        for (int j = 1; j < QK_SWQ_4; ++j) {
+            min = MIN(min, xb[j]);
+            max = MAX(max, xb[j]);
+        }
+        for (int c = 0; c < 16; ++c) {
+            codebook[c] = min + (max - min) * c / 15.0f;
+        }
+
+        uint8_t indices[QK_SWQ_4];
+        for (int iteration = 0; iteration < 4; ++iteration) {
+            float sums[16] = { 0.0f };
+            int counts[16] = { 0 };
+            for (int j = 0; j < QK_SWQ_4; ++j) {
+                int best = 0;
+                float best_error = fabsf(xb[j] - codebook[0]);
+                for (int c = 1; c < 16; ++c) {
+                    const float error = fabsf(xb[j] - codebook[c]);
+                    if (error < best_error) {
+                        best = c;
+                        best_error = error;
+                    }
+                }
+                indices[j] = best;
+                sums[best] += xb[j];
+                counts[best]++;
+            }
+            for (int c = 0; c < 16; ++c) {
+                if (counts[c] > 0) {
+                    codebook[c] = sums[c] / counts[c];
+                }
+            }
+        }
+
+        for (int j = 0; j < QK_SWQ_4; ++j) {
+            int best = 0;
+            float best_error = fabsf(xb[j] - codebook[0]);
+            for (int c = 1; c < 16; ++c) {
+                const float error = fabsf(xb[j] - codebook[c]);
+                if (error < best_error) {
+                    best = c;
+                    best_error = error;
+                }
+            }
+            indices[j] = best;
+        }
+
+        for (int c = 0; c < 16; ++c) {
+            y[i].codebook[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        for (int j = 0; j < QK_SWQ_4 / 2; ++j) {
+            y[i].qs[j] = indices[j] | (indices[j + QK_SWQ_4 / 2] << 4);
+        }
+    }
+}
+
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
     const int qk = QK4_1;
 
@@ -414,6 +479,18 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
             y[i*qk + j + 0   ] = x0*d;
             y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
+void dequantize_row_q_swq_4(const block_q_swq_4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_4 == 0);
+
+    const int nb = k / QK_SWQ_4;
+    for (int i = 0; i < nb; ++i) {
+        for (int j = 0; j < QK_SWQ_4 / 2; ++j) {
+            y[i * QK_SWQ_4 + j] = GGML_FP16_TO_FP32(x[i].codebook[x[i].qs[j] & 0x0f]);
+            y[i * QK_SWQ_4 + j + QK_SWQ_4 / 2] = GGML_FP16_TO_FP32(x[i].codebook[x[i].qs[j] >> 4]);
         }
     }
 }
@@ -2066,6 +2143,12 @@ size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+size_t quantize_q_swq_4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_4_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_4, n_per_row);
 }
 
 static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
@@ -5464,6 +5547,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
+            } break;
+        case GGML_TYPE_Q_SWQ_4:
+            {
+                const block_q_swq_4 * q = (const block_q_swq_4 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < 16; ++j) {
+                        if (!validate_fp16(q[i].codebook[j], i)) {
+                            return false;
+                        }
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_1:
             {

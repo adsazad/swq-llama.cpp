@@ -12,6 +12,99 @@
 
 LLM inference in C/C++
 
+## Experimental SWQ quantization notes
+
+This fork contains an experimental `Q_SWQ_4` block-wise codebook quantizer for
+GGUF tensors. It is research/prototype code, not an upstream-ready production
+format yet.
+
+SWQ stores weights as shared codebook values plus compact 4-bit indices. The
+current prototype uses 128-weight blocks:
+
+```text
+128 weights represented by:
+  16 FP16 codebook values
+  128 packed 4-bit indices
+```
+
+This gives a raw SWQ block cost of 96 bytes per 128 weights, or about 6 bits per
+weight. CPU inference support is implemented first. GPU support is not
+implemented.
+
+Test model used for the current measurements:
+
+```text
+Qwen2.5-0.5B-Instruct FP16 GGUF
+CPU-only run on macOS arm64
+Prompt: "The capital of India is"
+16 generated tokens, 4 threads
+```
+
+Current benchmark summary:
+
+| Model | File size | Peak RAM | Generation speed |
+|---|---:|---:|---:|
+| FP16 original | 1,266,425,696 bytes | 1,437,073,408 bytes | 16.9 t/s |
+| Q8_0 | 675,710,816 bytes | 1,265,451,008 bytes | 16.4 t/s |
+| Full SWQ128 | 521,347,936 bytes | 726,646,784 bytes | 2.8 t/s |
+| Q8_0 + SWQ128 K/V | 673,990,496 bytes | 1,208,811,520 bytes | 14.9 t/s |
+| Q8_0 + SWQ128 all attention | 661,948,256 bytes | 1,184,022,528 bytes | 8.0 t/s |
+
+The usable model on this system is `Q8_0 + SWQ128 K/V`. It keeps generation
+above the 10 tokens/sec target while still saving memory:
+
+```text
+RAM saved vs FP16:
+  228,261,888 bytes
+  217.69 MiB
+  15.88% saved
+  1.19x RAM ratio
+
+RAM saved vs Q8_0:
+  56,639,488 bytes
+  54.02 MiB
+  4.48% saved
+  1.05x RAM ratio
+```
+
+Full SWQ128 saves much more RAM, about 677.52 MiB vs FP16, but it is too slow
+with the current scalar CPU codebook lookup kernel. The practical conclusion is:
+
+```text
+Full SWQ128 proves compression works, but is not fast enough yet.
+Q8_0 + selective SWQ128 on K/V tensors is the current usable configuration.
+```
+
+Example mixed conversion command:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+  --tensor-type attn_k=q_swq_4 \
+  --tensor-type attn_v=q_swq_4 \
+  model-f16.gguf \
+  model-q8-swq-kv-128.gguf \
+  Q8_0
+```
+
+Example inference command:
+
+```sh
+./build/bin/llama-cli \
+  -m model-q8-swq-kv-128.gguf \
+  -ngl 0 \
+  --swq-stats \
+  --single-turn \
+  -p "The capital of India is" \
+  -n 64 \
+  -t 4 \
+  --temp 0.7
+```
+
+Implementation notes and full findings are in:
+
+- `docs/development/SWQ.md`
+- `docs/development/SWQ-FINDINGS.md`
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)

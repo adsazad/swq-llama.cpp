@@ -188,6 +188,14 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// Experimental SWQ prototype: a block-local FP16 codebook and packed 4-bit indices.
+#define QK_SWQ_4 128
+typedef struct {
+    ggml_half codebook[16];
+    uint8_t qs[QK_SWQ_4 / 2];
+} block_q_swq_4;
+static_assert(sizeof(block_q_swq_4) == 16 * sizeof(ggml_half) + QK_SWQ_4 / 2, "wrong q_swq_4 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

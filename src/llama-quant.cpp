@@ -800,6 +800,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16: return GGML_TYPE_BF16;
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_4: return GGML_TYPE_Q_SWQ_4;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
@@ -879,7 +880,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, use_mmap, /*use_direct_io*/ false, /*check_tensors*/ true, /*no_alloc*/ false, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, use_mmap, /*use_direct_io*/ false, /*check_tensors*/ true, /*no_alloc*/ false,
+        /*swq_stats*/ false, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
     auto mparams = llama_model_default_params();
@@ -1066,6 +1068,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
+    auto print_swq_tensor_stats = [params](const ggml_tensor * tensor, ggml_type new_type, size_t original, size_t compressed) {
+        if (!params->swq_stats || new_type != GGML_TYPE_Q_SWQ_4) {
+            return;
+        }
+        const size_t saved = original - compressed;
+        LLAMA_LOG_INFO("SWQ stats: tensor=%s original_type=%s original_bytes=%zu swq_bytes=%zu saved_bytes=%zu ratio=%.2fx saved=%.2f%%\n",
+                tensor->name, ggml_type_name(tensor->type), original, compressed, saved,
+                (double) original / compressed, 100.0 * saved / original);
+    };
 
     std::vector<std::thread> workers;
     workers.reserve(nthread);
@@ -1167,6 +1178,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
             total_size_org += tensor_size;
             total_size_new += new_size;
+            print_swq_tensor_stats(tensor, new_type, tensor_size, new_size);
             continue;
         } else {
             // no --dry-run, perform quantization
@@ -1250,6 +1262,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
             total_size_org += tensor_size;
             total_size_new += new_size;
+            print_swq_tensor_stats(tensor, new_type, tensor_size, new_size);
 
             // update the gguf meta data as we go
             gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
@@ -1268,6 +1281,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
+    if (params->swq_stats && params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_4) {
+        const size_t saved = total_size_org - total_size_new;
+        LLAMA_LOG_INFO("SWQ original tensor bytes: %zu\n", total_size_org);
+        LLAMA_LOG_INFO("SWQ tensor bytes: %zu\n", total_size_new);
+        LLAMA_LOG_INFO("SWQ compression ratio: %.2fx\n", (double) total_size_org / total_size_new);
+        LLAMA_LOG_INFO("SWQ percentage saved: %.2f%%\n", 100.0 * saved / total_size_org);
+    }
 
     if (!params->imatrix && params->dry_run && will_require_imatrix) {
         LLAMA_LOG_WARN("%s: WARNING: dry run completed successfully, but actually completing this quantization will require an imatrix!\n",
@@ -1297,6 +1317,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.dry_run                     =*/ false,
+        /*.swq_stats                   =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,

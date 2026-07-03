@@ -1532,6 +1532,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION, LLAMA_EXAMPLE_MTMD}));
     add_opt(common_arg(
+        {"--swq-stats"},
+        "print experimental SWQ compression statistics after loading",
+        [](common_params & params) {
+            params.swq_stats = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--perf"},
         {"--no-perf"},
         string_format("whether to enable internal libllama performance timings (default: %s)", params.no_perf ? "true" : "false"),

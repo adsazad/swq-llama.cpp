@@ -38,6 +38,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_4:   name = LLAMA_FTYPE_PREFIX "Q_SWQ_4 (experimental)"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
@@ -525,9 +526,10 @@ llama_model_loader::llama_model_loader(
         bool use_direct_io,
         bool check_tensors,
         bool no_alloc,
+        bool swq_stats,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        : check_tensors(check_tensors), no_alloc(no_alloc), swq_stats(swq_stats), metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -745,6 +747,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
             case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
             case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
+            case GGML_TYPE_Q_SWQ_4: ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_4; break;
             case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
             case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
             case GGML_TYPE_Q5_1:    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;    break;
@@ -1705,5 +1708,35 @@ void llama_model_loader::print_info() const {
         LLAMA_LOG_INFO("%s: file size   = %.2f MiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0,        n_bytes*8.0/n_elements);
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
+    }
+
+    if (swq_stats) {
+        size_t original_bytes = 0;
+        size_t compressed_bytes = 0;
+        LLAMA_LOG_INFO("SWQ tensor statistics (experimental; original is estimated as FP16):\n");
+        LLAMA_LOG_INFO("%-40s %-10s %14s %14s %14s %9s\n", "tensor", "original", "original bytes", "SWQ bytes", "saved bytes", "ratio");
+        for (const auto & item : weights_map) {
+            const ggml_tensor * tensor = item.second.tensor;
+            if (tensor->type != GGML_TYPE_Q_SWQ_4) {
+                continue;
+            }
+            const size_t tensor_original = ggml_nelements(tensor) * sizeof(ggml_fp16_t);
+            const size_t tensor_compressed = ggml_nbytes(tensor);
+            const int64_t tensor_saved = (int64_t) tensor_original - (int64_t) tensor_compressed;
+            LLAMA_LOG_INFO("%-40s %-10s %14zu %14zu %14lld %8.2fx\n", tensor->name, "F16 est.", tensor_original,
+                    tensor_compressed, (long long) tensor_saved, (double) tensor_original / tensor_compressed);
+            original_bytes += tensor_original;
+            compressed_bytes += tensor_compressed;
+        }
+        if (compressed_bytes > 0) {
+            const int64_t saved = (int64_t) original_bytes - (int64_t) compressed_bytes;
+            LLAMA_LOG_INFO("Original estimated weight memory: %.2f MiB\n", original_bytes / 1024.0 / 1024.0);
+            LLAMA_LOG_INFO("SWQ compressed weight memory: %.2f MiB\n", compressed_bytes / 1024.0 / 1024.0);
+            LLAMA_LOG_INFO("Estimated memory saved: %.2f MiB\n", saved / 1024.0 / 1024.0);
+            LLAMA_LOG_INFO("Compression ratio: %.2fx\n", (double) original_bytes / compressed_bytes);
+            LLAMA_LOG_INFO("Percentage saved: %.2f%%\n", 100.0 * saved / original_bytes);
+        } else {
+            LLAMA_LOG_INFO("No SWQ tensors found.\n");
+        }
     }
 }
