@@ -667,6 +667,8 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q_SWQ_4:
+        case GGML_TYPE_Q_SWQ_FIT_2:
+        case GGML_TYPE_Q_SWQ_FIT_3:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4445,6 +4447,8 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q_SWQ_4:
+        case GGML_TYPE_Q_SWQ_FIT_2:
+        case GGML_TYPE_Q_SWQ_FIT_3:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4946,6 +4950,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q_SWQ_4:
+        case GGML_TYPE_Q_SWQ_FIT_2:
+        case GGML_TYPE_Q_SWQ_FIT_3:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -5673,6 +5679,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q_SWQ_4:
+        case GGML_TYPE_Q_SWQ_FIT_2:
+        case GGML_TYPE_Q_SWQ_FIT_3:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:

@@ -196,6 +196,24 @@ typedef struct {
 } block_q_swq_4;
 static_assert(sizeof(block_q_swq_4) == 16 * sizeof(ggml_half) + QK_SWQ_4 / 2, "wrong q_swq_4 block size/padding");
 
+// Experimental SWQ fit prototype: cubic coefficients plus 2-bit residual codebook.
+#define QK_SWQ_FIT_2 128
+typedef struct {
+    ggml_half coeffs[4];
+    ggml_half residuals[4];
+    uint8_t qs[QK_SWQ_FIT_2 / 4];
+} block_q_swq_fit_2;
+static_assert(sizeof(block_q_swq_fit_2) == 8 * sizeof(ggml_half) + QK_SWQ_FIT_2 / 4, "wrong q_swq_fit_2 block size/padding");
+
+// Experimental SWQ fit prototype: cubic coefficients plus 3-bit residual codebook.
+#define QK_SWQ_FIT_3 128
+typedef struct {
+    ggml_half coeffs[4];
+    ggml_half residuals[8];
+    uint8_t qs[QK_SWQ_FIT_3 * 3 / 8];
+} block_q_swq_fit_3;
+static_assert(sizeof(block_q_swq_fit_3) == 12 * sizeof(ggml_half) + QK_SWQ_FIT_3 * 3 / 8, "wrong q_swq_fit_3 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

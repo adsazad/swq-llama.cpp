@@ -35,6 +35,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q1_0",     LLAMA_FTYPE_MOSTLY_Q1_0,     " 1.125 bpw quantization",           },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q_SWQ_4",  LLAMA_FTYPE_MOSTLY_Q_SWQ_4,  " experimental 6 bpw block codebook", },
+    { "Q_SWQ_FIT_2", LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_2, " experimental 3 bpw cubic fit + residual", },
+    { "Q_SWQ_FIT_3", LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_3, " experimental 4.5 bpw cubic fit + residual", },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
@@ -164,6 +166,12 @@ static void usage(const char * executable) {
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
     printf("  --swq-stats\n");
     printf("                                      print detailed experimental SWQ compression statistics\n");
+    printf("  --swq-fit-epochs N\n");
+    printf("                                      experimental Q_SWQ_FIT_* fit epochs (default: 72)\n");
+    printf("  --swq-fit-residual-epochs N\n");
+    printf("                                      experimental Q_SWQ_FIT_* residual updates per fit epoch (default: 4)\n");
+    printf("  --swq-fit-progress\n");
+    printf("                                      print experimental Q_SWQ_FIT_* per-epoch reconstruction stats\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -447,6 +455,20 @@ int llama_quantize(int argc, char ** argv) {
             params.dry_run = true;
         } else if (strcmp(argv[arg_idx], "--swq-stats") == 0) {
             params.swq_stats = true;
+        } else if (strcmp(argv[arg_idx], "--swq-fit-epochs") == 0) {
+            if (arg_idx < argc - 1) {
+                params.swq_fit_epochs = std::max(1, atoi(argv[++arg_idx]));
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--swq-fit-residual-epochs") == 0) {
+            if (arg_idx < argc - 1) {
+                params.swq_fit_residual_epochs = std::max(1, atoi(argv[++arg_idx]));
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--swq-fit-progress") == 0) {
+            params.swq_fit_progress = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {

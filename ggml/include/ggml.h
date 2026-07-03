@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q_SWQ_4 = 42, // experimental: per-block FP16 codebook with 4-bit indices
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q_SWQ_FIT_2 = 43, // experimental: cubic fit plus 2-bit residuals
+        GGML_TYPE_Q_SWQ_FIT_3 = 44, // experimental: cubic fit plus 3-bit residuals
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision
@@ -475,6 +477,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q_SWQ_4 = 28, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_FIT_2 = 29, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_FIT_3 = 30, // experimental, except 1d tensors
     };
 
     // available tensor operations:

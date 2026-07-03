@@ -34,6 +34,14 @@ void quantize_row_q_swq_4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
     quantize_row_q_swq_4_ref(x, y, k);
 }
 
+void quantize_row_q_swq_fit_2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_fit_2_ref(x, y, k);
+}
+
+void quantize_row_q_swq_fit_3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_fit_3_ref(x, y, k);
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }
@@ -176,6 +184,89 @@ void ggml_vec_dot_q_swq_4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
             const block_q8_0 * GGML_RESTRICT y1 = y + i * (QK_SWQ_4 / QK8_0) + j1 / QK8_0;
             sum += cb[j0 / QK8_0][q & 0x0f] * y0->qs[j0 % QK8_0];
             sum += cb[j1 / QK8_0][q >> 4]   * y1->qs[j1 % QK8_0];
+        }
+    }
+
+    *s = sum;
+}
+
+// Experimental scalar SWQ fit x Q8_0 path.
+void ggml_vec_dot_q_swq_fit_2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_FIT_2 == 0);
+    assert(QK_SWQ_FIT_2 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_q_swq_fit_2 * GGML_RESTRICT x = vx;
+    const block_q8_0        * GGML_RESTRICT y = vy;
+
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_FIT_2; ++i) {
+        float coeffs[4];
+        float residuals[4];
+        for (int c = 0; c < 4; ++c) {
+            coeffs[c] = GGML_CPU_FP16_TO_FP32(x[i].coeffs[c]);
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+
+        for (int j = 0; j < QK_SWQ_FIT_2; ++j) {
+            const float t = -1.0f + 2.0f * j / (QK_SWQ_FIT_2 - 1);
+            const float base = coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * coeffs[3]));
+            const uint8_t q = (x[i].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_FIT_2 / QK8_0) + j / QK8_0;
+            const float d = GGML_CPU_FP16_TO_FP32(yb->d);
+            sum += (base + residuals[q]) * d * yb->qs[j % QK8_0];
+        }
+    }
+
+    *s = sum;
+}
+
+static uint8_t swq_fit_3_get_index_cpu(const uint8_t qs[QK_SWQ_FIT_3 * 3 / 8], int j) {
+    const int bit = 3 * j;
+    const int byte = bit / 8;
+    const int shift = bit % 8;
+    uint16_t v = qs[byte] >> shift;
+    if (shift > 5) {
+        v |= (uint16_t) qs[byte + 1] << (8 - shift);
+    }
+    return v & 0x07;
+}
+
+// Experimental scalar SWQ fit x Q8_0 path.
+void ggml_vec_dot_q_swq_fit_3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_FIT_3 == 0);
+    assert(QK_SWQ_FIT_3 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_q_swq_fit_3 * GGML_RESTRICT x = vx;
+    const block_q8_0        * GGML_RESTRICT y = vy;
+
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_FIT_3; ++i) {
+        float coeffs[4];
+        float residuals[8];
+        for (int c = 0; c < 4; ++c) {
+            coeffs[c] = GGML_CPU_FP16_TO_FP32(x[i].coeffs[c]);
+        }
+        for (int c = 0; c < 8; ++c) {
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+
+        for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+            const float t = -1.0f + 2.0f * j / (QK_SWQ_FIT_3 - 1);
+            const float base = coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * coeffs[3]));
+            const uint8_t q = swq_fit_3_get_index_cpu(x[i].qs, j);
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_FIT_3 / QK8_0) + j / QK8_0;
+            const float d = GGML_CPU_FP16_TO_FP32(yb->d);
+            sum += (base + residuals[q]) * d * yb->qs[j % QK8_0];
         }
     }
 

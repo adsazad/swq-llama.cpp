@@ -156,6 +156,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q_SWQ_4       = 41, // experimental, except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_2   = 42, // experimental, except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_3   = 43, // experimental, except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -423,6 +425,9 @@ extern "C" {
         bool keep_split;                                            // quantize to the same number of shards
         bool dry_run;                                               // calculate and show the final quantization size without performing quantization
         bool swq_stats;                                             // print experimental SWQ compression statistics
+        int32_t swq_fit_epochs;                                     // experimental Q_SWQ_FIT_* fit epochs
+        int32_t swq_fit_residual_epochs;                            // experimental Q_SWQ_FIT_* residual epochs per fit epoch
+        bool swq_fit_progress;                                      // print experimental Q_SWQ_FIT_* epoch progress
         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides

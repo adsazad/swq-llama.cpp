@@ -178,15 +178,571 @@ save about 54.02 MiB peak RSS on this run while staying above 10 generation
 tokens/sec. Expanding SWQ to all attention tensors saves more RAM and file size
 but falls below the speed target.
 
+## Equation-based SWQ FIT follow-up
+
+A separate experimental type, `Q_SWQ_FIT_2`, was added. It stores each
+128-weight block as a cubic equation plus 2-bit residuals:
+
+```text
+4 FP16 cubic coefficients
+4 FP16 residual values
+128 packed 2-bit residual indices
+48 bytes per 128 weights
+3 bpw
+```
+
+Full `Q_SWQ_FIT_2` conversion:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-fit-2.gguf \
+    Q_SWQ_FIT_2
+```
+
+Full `Q_SWQ_FIT_2` compressed strongly, but output quality and speed were bad:
+
+| Model | File bytes | Max RSS | Prompt speed | Generation speed | Output |
+|---|---:|---:|---:|---:|---|
+| Full Q_SWQ_FIT_2 | 336,112,480 | 545,701,888 | 62.4 t/s | 1.2 t/s | incoherent |
+
+Converter summary:
+
+- Quant size: 314.87 MiB, 4.19 BPW
+- SWQ tensor bytes: 330,164,736
+- SWQ compression ratio: 3.82x
+- SWQ percentage saved: 73.81%
+
+The smoke output was:
+
+```text
+. I. I.
+.
+The and
+
+2
+```
+
+Layer-by-layer approximation error was measured with:
+
+```sh
+python3 tools/swq-accuracy.py \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-fit-2.gguf \
+    --csv models/swq/accuracy-swq-fit-2.csv
+```
+
+Layer relative RMSE was roughly 0.35 across most transformer blocks, and the
+worst tensors were above 0.42 relative RMSE. This confirms that the cubic
+equation plus 2-bit residual approximation is too lossy for full-model use.
+
+Selective K/V-only `Q_SWQ_FIT_2` over a Q8_0 base:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    --tensor-type attn_k=q_swq_fit_2 \
+    --tensor-type attn_v=q_swq_fit_2 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q8-swq-fit-kv.gguf \
+    Q8_0
+```
+
+| Model | File bytes | Max RSS | Prompt speed | Generation speed | Output |
+|---|---:|---:|---:|---:|---|
+| Q8_0 + Q_SWQ_FIT_2 K/V | 671,926,112 | 1,257,635,840 | 139.7 t/s | 10.8 t/s | coherent |
+
+This is above the 10 t/s target, but it only saved about 7.45 MiB peak RSS
+versus Q8_0 in this run. The earlier `Q8_0 + Q_SWQ_4 K/V` model remains the
+better usable result.
+
+### Conversion-time FIT epochs
+
+`Q_SWQ_FIT_2` conversion was updated to run alternating fit epochs. Each block
+now repeats:
+
+```text
+fit cubic equation
+assign residual indices
+update residual codebook
+refit cubic equation against residual-corrected weights
+```
+
+This does not change the file layout or model size. It only spends more time
+during conversion to improve the coefficients and residual assignments.
+
+Full `Q_SWQ_FIT_2` with conversion-time epochs:
+
+| Model | File bytes | Max RSS | Prompt speed | Generation speed | Output |
+|---|---:|---:|---:|---:|---|
+| Full Q_SWQ_FIT_2, epochs | 336,112,480 | 544,587,776 | 95.9 t/s | 2.7 t/s | incoherent |
+
+Compared with the first FIT attempt:
+
+- conversion time increased from about 5.47s to about 22.52s
+- layer relative RMSE improved from roughly 0.35 to roughly 0.32
+- worst-tensor relative RMSE improved from above 0.42 to about 0.39
+- generation speed improved from 1.2 t/s to 2.7 t/s
+- output remained incoherent
+
+Updated graph report:
+
+```text
+models/swq/swq-fit-2-epochs-layer-report.html
+```
+
+The epoch system helps, but the 3 bpw equation-plus-2-bit-residual format is
+still too inaccurate for full-model use.
+
+### Higher epoch run: 24 fit epochs x 4 residual iterations
+
+The FIT converter was then increased from:
+
+```text
+6 fit epochs x 2 residual iterations
+```
+
+to:
+
+```text
+24 fit epochs x 4 residual iterations
+```
+
+This is much more expensive during conversion but keeps the same file format and
+same 3 bpw block size.
+
+Full `Q_SWQ_FIT_2` 24x4 result:
+
+| Model | File bytes | Max RSS | Prompt speed | Generation speed | Output |
+|---|---:|---:|---:|---:|---|
+| Full Q_SWQ_FIT_2, 24x4 | 336,112,480 | 548,159,488 | 10.2 t/s | 1.1 t/s | incoherent |
+
+Conversion time:
+
+```text
+6x2:  22.52s
+24x4: 110.90s
+```
+
+Tensor-level reconstruction summary:
+
+| Run | Mean tensor rel RMSE | Worst tensor rel RMSE | Mean tensor cosine |
+|---|---:|---:|---:|
+| first FIT | 0.36596 | 0.42471 | 0.93033 |
+| 6x2 epochs | 0.33654 | 0.39187 | 0.94141 |
+| 24x4 epochs | 0.33495 | 0.38997 | 0.94199 |
+
+The 24x4 run only slightly improved reconstruction error compared with 6x2, but
+conversion time increased by about 4.9x. Output remained incoherent:
+
+```text
+`. A
+.主义
+.在
+.主义
+.
+
+.
+```
+
+This shows diminishing returns from more epochs. Further epoch increases are
+unlikely to fix the format by themselves. The next meaningful accuracy step is
+probably a larger residual budget, such as `Q_SWQ_FIT_4`, not just more epochs.
+
+Updated graph report:
+
+```text
+models/swq/swq-fit-2-epochs24-layer-report.html
+```
+
+### Triple epoch run: 72 fit epochs x 4 residual iterations
+
+The fit epochs were tripled again:
+
+```text
+72 fit epochs x 4 residual iterations
+```
+
+This run confirmed convergence. Accuracy was effectively unchanged from 24x4,
+while conversion time increased heavily.
+
+| Run | Conversion time | Mean tensor rel RMSE | Worst tensor rel RMSE | Mean tensor cosine |
+|---|---:|---:|---:|---:|
+| first FIT | 5.47s | 0.365959 | 0.424710 | 0.930333 |
+| 6x2 epochs | 22.52s | 0.336538 | 0.391867 | 0.941415 |
+| 24x4 epochs | 110.90s | 0.334946 | 0.389966 | 0.941987 |
+| 72x4 epochs | 484.64s | 0.334946 | 0.389966 | 0.941987 |
+
+Full `Q_SWQ_FIT_2` 72x4 smoke result:
+
+| Model | File bytes | Max RSS | Prompt speed | Generation speed | Output |
+|---|---:|---:|---:|---:|---|
+| Full Q_SWQ_FIT_2, 72x4 | 336,112,480 | 547,209,216 | 69.3 t/s | 1.4 t/s | incoherent |
+
+Output remained bad:
+
+```text
+`.在
+.主义
+.
+```
+
+Conclusion from the 72x4 run: more epochs no longer improve the reconstruction.
+The 2-bit residual budget is the limiting factor.
+
+Updated graph report:
+
+```text
+models/swq/swq-fit-2-epochs72-layer-report.html
+```
+
+### Higher epoch check: 144 fit epochs x 4 residual iterations
+
+One more increased-epoch run was tested after making epochs configurable:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    --swq-fit-epochs 144 \
+    --swq-fit-residual-epochs 4 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-fit-2-epochs144.gguf \
+    Q_SWQ_FIT_2
+```
+
+Conversion completed, but `/usr/bin/time -l` returned code 1 after conversion
+because `sysctl kern.clockrate` was blocked in the sandbox. The GGUF file was
+still written successfully.
+
+| Run | Conversion time | Mean tensor rel RMSE | Worst tensor rel RMSE | Mean tensor cosine |
+|---|---:|---:|---:|---:|
+| first FIT | 5.47s | 0.365959 | 0.424710 | 0.930333 |
+| 6x2 epochs | 22.52s | 0.336538 | 0.391867 | 0.941415 |
+| 24x4 epochs | 110.90s | 0.334946 | 0.389966 | 0.941987 |
+| 72x4 epochs | 484.64s | 0.334946 | 0.389966 | 0.941987 |
+| 144x4 epochs | 862.09s | 0.334946 | 0.389966 | 0.941987 |
+
+Full `Q_SWQ_FIT_2` 144x4 conversion result:
+
+| Model | File bytes | Quant size | SWQ original tensor bytes | SWQ tensor bytes | SWQ ratio | SWQ saved |
+|---|---:|---:|---:|---:|---:|---:|
+| Full Q_SWQ_FIT_2, 144x4 | 336,112,480 | 314.87 MiB | 1,260,477,952 | 330,164,736 | 3.82x | 73.81% |
+
+The 144x4 accuracy is bit-for-bit equivalent to 72x4 at the summary level. That
+means more epochs are not useful for this `Q_SWQ_FIT_2` design. The next useful
+accuracy experiment is a larger residual format, such as a 4-bit residual
+variant, not more epochs.
+
+Updated graph report:
+
+```text
+models/swq/swq-fit-2-epochs144-layer-report.html
+```
+
+### Lossless predictor experiment
+
+A separate offline analyzer was added to test exact reconstruction before adding
+another runtime format:
+
+```text
+tools/swq-lossless-analyze.py
+```
+
+This tests the predictive lossless idea:
+
+```text
+original FP16 bits = predicted FP16 bits XOR exact residual bits
+```
+
+The predictor is trained per block, then the exact residual stream is compressed
+with zlib. This guarantees exact reconstruction of the original FP16 bits. The
+test answers only one question: does equation-plus-exact-residual compression
+save enough space to justify a runtime format?
+
+Focused K/V-only test:
+
+```sh
+python3 tools/swq-lossless-analyze.py \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    --include 'blk\.[0-9]+\.attn_[kv]\.weight' \
+    --block-sizes 32,128,512 \
+    --predictors mean,cubic,delta \
+    --zlib-level 1 \
+    --csv models/swq/swq-lossless-analysis-kv.csv \
+    --html models/swq/swq-lossless-analysis-kv.html
+```
+
+K/V exact result:
+
+| Tensor set | Original bytes | Best exact bytes | Compression ratio | Saved |
+|---|---:|---:|---:|---:|
+| K/V weights | 11,010,048 | 10,521,011 | 1.046x | 4.44% |
+
+Broader transformer-weight test:
+
+```sh
+python3 tools/swq-lossless-analyze.py \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    --include 'blk\.[0-9]+\..*\.weight' \
+    --block-sizes 128,512 \
+    --predictors cubic,delta \
+    --zlib-level 1 \
+    --csv models/swq/swq-lossless-analysis-blocks.csv \
+    --html models/swq/swq-lossless-analysis-blocks.html
+```
+
+Transformer exact result:
+
+| Tensor set | Original bytes | Best exact bytes | Compression ratio | Saved |
+|---|---:|---:|---:|---:|
+| Transformer weights | 715,739,136 | 676,472,697 | 1.058x | 5.49% |
+
+The best predictor was usually delta with block size 512. This is important:
+exact predictive compression works, but savings are too small for the current
+goal. A runtime format would also need on-the-fly decompression, likely making
+inference slower. This path should not be implemented in llama.cpp unless a much
+better residual compressor or predictor is found.
+
+Saved reports:
+
+```text
+models/swq/swq-lossless-analysis-kv.html
+models/swq/swq-lossless-analysis-blocks.html
+```
+
+### FIT_2 / FIT_3 / FIT_4 correction sweep
+
+After the lossless test showed too little compression, a lossy correction-width
+sweep was added:
+
+```text
+tools/swq-fit-sweep.py
+```
+
+This tests the same high-compression family as `Q_SWQ_FIT_2`, but estimates
+larger correction codebooks before adding new runtime tensor types. The sweep
+uses:
+
+```text
+128 weights per block
+cubic predictor per block
+uniform residual codebook
+2-bit, 3-bit, or 4-bit correction indices
+```
+
+The broader transformer-weight sweep used:
+
+```sh
+python3 tools/swq-fit-sweep.py \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    --include 'blk\.[0-9]+\..*\.weight' \
+    --bits 2,3,4 \
+    --block-size 128 \
+    --csv models/swq/swq-fit-sweep-blocks.csv \
+    --html models/swq/swq-fit-sweep-blocks.html
+```
+
+Transformer-weight sweep result:
+
+| Format | Original bytes | Estimated SWQ bytes | Compression ratio | Saved | Rel RMSE |
+|---|---:|---:|---:|---:|---:|
+| FIT_2 | 715,739,136 | 134,201,088 | 5.333x | 81.25% | 0.398676 |
+| FIT_3 | 715,739,136 | 201,301,632 | 3.556x | 71.88% | 0.169957 |
+| FIT_4 | 715,739,136 | 290,769,024 | 2.462x | 59.38% | 0.078962 |
+
+This shows the useful tradeoff clearly:
+
+```text
+FIT_2: close to current high compression, but too inaccurate
+FIT_3: still near 70% savings, much lower error
+FIT_4: best accuracy, but compression drops to about 59%
+```
+
+For the user's target of roughly 70% compression, `FIT_3` is the most relevant
+next runtime experiment. `FIT_4` is the safer accuracy experiment if `FIT_3`
+still produces incoherent output.
+
+Saved reports:
+
+```text
+models/swq/swq-fit-sweep-blocks.html
+models/swq/swq-fit-sweep-blocks.csv
+models/swq/swq-fit-sweep-blocks.log
+```
+
+A layer-by-layer visual comparison report was also generated:
+
+```text
+models/swq/swq-fit-comparison-report.html
+models/swq/swq-fit-comparison-report.csv
+models/swq/swq-fit-comparison-report.log
+```
+
+The graph report overlays original FP16 layer samples with the values predicted
+by FIT_2, FIT_3, and FIT_4. Metrics are computed over all selected transformer
+weight values; the plotted lines are downsampled so the browser remains usable.
+
+### Runtime Q_SWQ_FIT_3 implementation
+
+`Q_SWQ_FIT_3` was then implemented in llama.cpp as a real GGUF tensor type:
+
+```text
+GGML_TYPE_Q_SWQ_FIT_3
+LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_3
+```
+
+Block layout:
+
+```text
+128 weights per block
+4 FP16 cubic coefficients
+8 FP16 residual values
+128 packed 3-bit residual indices
+72 bytes per block
+4.5 bpw
+```
+
+The implementation is CPU-only and experimental. It reuses the same conversion
+controls as `Q_SWQ_FIT_2`:
+
+```text
+--swq-fit-epochs
+--swq-fit-residual-epochs
+--swq-fit-progress
+```
+
+Full `Q_SWQ_FIT_3` conversion, 72 fit epochs x 4 residual iterations:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    --swq-fit-epochs 72 \
+    --swq-fit-residual-epochs 4 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-fit-3-epochs72.gguf \
+    Q_SWQ_FIT_3
+```
+
+72x4 conversion result:
+
+| Model | File size | Quant size | SWQ tensor bytes | SWQ ratio | SWQ saved | Conversion time |
+|---|---:|---:|---:|---:|---:|---:|
+| Full Q_SWQ_FIT_3, 72x4 | 409 MB | 403.20 MiB | 422,782,464 | 2.98x | 66.46% | 388.79s |
+
+Accuracy compared with `Q_SWQ_FIT_2`:
+
+| Run | Mean tensor rel RMSE | Worst tensor rel RMSE | Mean tensor cosine |
+|---|---:|---:|---:|
+| FIT_2 72x4 | 0.334946 | 0.389966 | 0.941987 |
+| FIT_3 72x4 | 0.177571 | 0.219497 | 0.984012 |
+
+Smoke result:
+
+| Model | Prompt speed | Generation speed | Output |
+|---|---:|---:|---|
+| Full Q_SWQ_FIT_3, 72x4 | 62.9 t/s | 2.7 t/s | `The capital of India is Delhi.` |
+
+This is a meaningful quality improvement over `Q_SWQ_FIT_2`: the output became
+coherent on the tiny prompt and reconstruction error dropped heavily. It is
+still too slow for the user's 10 t/s target with the current scalar CPU dot
+kernel.
+
+Full `Q_SWQ_FIT_3` conversion, 144 fit epochs x 4 residual iterations:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    --swq-fit-epochs 144 \
+    --swq-fit-residual-epochs 4 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-fit-3-epochs144.gguf \
+    Q_SWQ_FIT_3
+```
+
+144x4 result:
+
+| Run | Conversion time | Mean tensor rel RMSE | Worst tensor rel RMSE | Mean tensor cosine |
+|---|---:|---:|---:|---:|
+| FIT_3 72x4 | 388.79s | 0.177571 | 0.219497 | 0.984012 |
+| FIT_3 144x4 | 1494.58s | 0.177571 | 0.219497 | 0.984012 |
+
+Conclusion: `Q_SWQ_FIT_3` converges by 72x4 for this model. More epochs did not
+improve reconstruction, and 144x4 was not worth the extra conversion time.
+
+Saved files:
+
+```text
+models/swq/qwen2.5-0.5b-instruct-q-swq-fit-3-epochs72.gguf
+models/swq/conversion-swq-fit-3-epochs72.log
+models/swq/smoke-swq-fit-3-epochs72.log
+models/swq/accuracy-swq-fit-3-epochs72.txt
+models/swq/accuracy-swq-fit-3-epochs72.csv
+models/swq/swq-fit-3-epochs72-layer-report.html
+models/swq/qwen2.5-0.5b-instruct-q-swq-fit-3-epochs144.gguf
+models/swq/conversion-swq-fit-3-epochs144.log
+models/swq/accuracy-swq-fit-3-epochs144.txt
+models/swq/accuracy-swq-fit-3-epochs144.csv
+models/swq/swq-fit-3-epochs144-layer-report.html
+```
+
+### Configurable FIT epochs and progress logging
+
+FIT epochs are now configurable from `llama-quantize`, so conversion experiments
+do not require rebuilding:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    --swq-fit-epochs 24 \
+    --swq-fit-residual-epochs 4 \
+    --swq-fit-progress \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-fit-2.gguf \
+    Q_SWQ_FIT_2
+```
+
+New flags:
+
+```text
+--swq-fit-epochs N
+--swq-fit-residual-epochs N
+--swq-fit-progress
+```
+
+`--swq-fit-progress` prints per-tensor, per-epoch reconstruction stats. Example
+from a short 2x1 K/V-only verification run:
+
+```text
+SWQ_FIT_2 epochs: tensor=blk.0.attn_k.weight blocks=896 fit_epochs=2 residual_epochs=1
+  epoch   1/  2 - rmse 0.029877587 - rel_rmse 0.47250399
+  epoch   2/  2 - rmse 0.027121888 - rel_rmse 0.42892354
+```
+
+Verification command:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+    --swq-fit-epochs 2 \
+    --swq-fit-residual-epochs 1 \
+    --swq-fit-progress \
+    --tensor-type attn_k=q_swq_fit_2 \
+    --tensor-type attn_v=q_swq_fit_2 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q8-swq-fit-kv-e2.gguf \
+    Q8_0
+```
+
+The progress verification completed successfully and wrote:
+
+```text
+models/swq/conversion-q8-swq-fit-kv-e2-progress.log
+```
+
 ## Current conclusions
 
 The prototype works end to end on CPU and provides measurable file and RAM
 savings relative to FP16. Full SWQ128 gives strong compression, but scalar
-codebook lookup is too slow for generation on this CPU. A mixed Q8_0 + SWQ128
-K/V model is the current best local tradeoff: it stays above 10 generation
-tokens/sec and saves some RAM versus Q8_0. The next useful experiment is an ARM
-NEON SWQ-by-Q8 activation dot kernel; without that, broad SWQ use is unlikely to
-be fast enough.
+codebook lookup is too slow for generation on this CPU. Full `Q_SWQ_FIT_2`
+compresses even more, but its approximation error is too high and output becomes
+incoherent. A mixed Q8_0 + SWQ128 K/V model is the current best local tradeoff:
+it stays above 10 generation tokens/sec and saves some RAM versus Q8_0. The next
+useful experiment is an ARM NEON SWQ-by-Q8 activation dot kernel; without that,
+broad SWQ use is unlikely to be fast enough.
 
 Perplexity, KL divergence, and direct Q4_K_M/Q8_0 benchmark runs have not yet
 been measured.
@@ -206,3 +762,51 @@ been measured.
 - `models/swq/smoke-q8-swq-kv-128.log`
 - `models/swq/conversion-q8-swq-attn-128.log`
 - `models/swq/smoke-q8-swq-attn-128.log`
+- `models/swq/conversion-swq-fit-2.log`
+- `models/swq/smoke-swq-fit-2.log`
+- `models/swq/accuracy-swq-fit-2.txt`
+- `models/swq/accuracy-swq-fit-2.csv`
+- `models/swq/conversion-q8-swq-fit-kv.log`
+- `models/swq/smoke-q8-swq-fit-kv.log`
+- `models/swq/conversion-swq-fit-2-epochs.log`
+- `models/swq/smoke-swq-fit-2-epochs.log`
+- `models/swq/accuracy-swq-fit-2-epochs.txt`
+- `models/swq/accuracy-swq-fit-2-epochs.csv`
+- `models/swq/swq-fit-2-epochs-layer-report.html`
+- `models/swq/conversion-swq-fit-2-epochs24.log`
+- `models/swq/smoke-swq-fit-2-epochs24.log`
+- `models/swq/accuracy-swq-fit-2-epochs24.txt`
+- `models/swq/accuracy-swq-fit-2-epochs24.csv`
+- `models/swq/swq-fit-2-epochs24-layer-report.html`
+- `models/swq/conversion-swq-fit-2-epochs72.log`
+- `models/swq/smoke-swq-fit-2-epochs72.log`
+- `models/swq/accuracy-swq-fit-2-epochs72.txt`
+- `models/swq/accuracy-swq-fit-2-epochs72.csv`
+- `models/swq/swq-fit-2-epochs72-layer-report.html`
+- `models/swq/conversion-swq-fit-2-epochs144.log`
+- `models/swq/accuracy-swq-fit-2-epochs144.csv`
+- `models/swq/swq-fit-2-epochs144-layer-report.html`
+- `models/swq/swq-lossless-analysis-kv.log`
+- `models/swq/swq-lossless-analysis-kv.csv`
+- `models/swq/swq-lossless-analysis-kv.html`
+- `models/swq/swq-lossless-analysis-blocks.log`
+- `models/swq/swq-lossless-analysis-blocks.csv`
+- `models/swq/swq-lossless-analysis-blocks.html`
+- `models/swq/swq-fit-sweep-smoke.csv`
+- `models/swq/swq-fit-sweep-smoke.html`
+- `models/swq/swq-fit-sweep-blocks.log`
+- `models/swq/swq-fit-sweep-blocks.csv`
+- `models/swq/swq-fit-sweep-blocks.html`
+- `models/swq/swq-fit-comparison-report.log`
+- `models/swq/swq-fit-comparison-report.csv`
+- `models/swq/swq-fit-comparison-report.html`
+- `models/swq/conversion-swq-fit-3-epochs72.log`
+- `models/swq/smoke-swq-fit-3-epochs72.log`
+- `models/swq/accuracy-swq-fit-3-epochs72.txt`
+- `models/swq/accuracy-swq-fit-3-epochs72.csv`
+- `models/swq/swq-fit-3-epochs72-layer-report.html`
+- `models/swq/conversion-swq-fit-3-epochs144.log`
+- `models/swq/accuracy-swq-fit-3-epochs144.txt`
+- `models/swq/accuracy-swq-fit-3-epochs144.csv`
+- `models/swq/swq-fit-3-epochs144-layer-report.html`
+- `models/swq/conversion-q8-swq-fit-kv-e2-progress.log`

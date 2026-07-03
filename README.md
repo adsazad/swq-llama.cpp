@@ -75,6 +75,42 @@ Full SWQ128 proves compression works, but is not fast enough yet.
 Q8_0 + selective SWQ128 on K/V tensors is the current usable configuration.
 ```
 
+A second experimental equation-based type, `Q_SWQ_FIT_2`, was also tested. It
+compresses more aggressively, using a cubic equation plus 2-bit residuals at
+about 3 bpw. Full `Q_SWQ_FIT_2` produced a 336,112,480 byte model and 545,701,888
+byte peak RAM, but generation dropped to 1.2 t/s and the output was incoherent.
+Layer-by-layer reconstruction checks showed roughly 0.35 relative RMSE across
+most transformer blocks, with worst tensors above 0.42. This format is therefore
+not usable for full-model quantization yet.
+
+`Q_SWQ_FIT_3` is now implemented as the next equation-based experiment. It uses
+a cubic equation plus 3-bit residuals at 4.5 bpw. On the small Qwen test model,
+full `Q_SWQ_FIT_3` saved 66.46% of SWQ tensor bytes versus FP16 tensors, reduced
+mean tensor relative RMSE from 0.334946 (`FIT_2` 72x4) to 0.177571, and produced
+coherent output on a 16-token smoke test. Generation was still slow at 2.7 t/s,
+so this is a quality improvement, not yet a speed win.
+
+Longer deterministic chat tests were run one process at a time with 4 CPU
+threads, `--temp 0`, and a 64-token generation limit. The results were mixed:
+
+| Test | FIT_3 result | FIT_3 speed | Q8_0 control |
+|---|---|---:|---|
+| Explain blue sky and red sunset | Coherent and correctly mentioned atmospheric scattering, but did not explain the red sunset | 2.4 t/s | Incomplete and scientifically weak; 59.0 t/s |
+| Apple arithmetic | Incorrectly treated the 8 apples sold as the number remaining; the correct final answer is 26 | 1.2 t/s | Not run in the corrected one-process test |
+| Exactly three backup steps | Coherent and followed the requested three-step format | 1.1 t/s | Not run in the corrected one-process test |
+
+These tests show that full `Q_SWQ_FIT_3` retains basic language generation and
+instruction following, but reasoning accuracy is not reliable. Its current
+scalar CPU path is also about 25x slower than the measured Q8_0 control on the
+same science prompt. A single coherent smoke response is therefore not enough
+to claim acceptable model quality; perplexity and a larger task evaluation are
+still required.
+
+An earlier attempt appeared to produce truncated responses because several
+`llama-cli` processes remained active after the command-output wrapper returned.
+Those results are not used above. The corrected measurements poll one process
+until it exits before starting the next model.
+
 Example mixed conversion command:
 
 ```sh
@@ -85,6 +121,32 @@ Example mixed conversion command:
   model-q8-swq-kv-128.gguf \
   Q8_0
 ```
+
+FIT epoch experiments can be configured without rebuilding:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+  --swq-fit-epochs 24 \
+  --swq-fit-residual-epochs 4 \
+  --swq-fit-progress \
+  model-f16.gguf \
+  model-q-swq-fit-2.gguf \
+  Q_SWQ_FIT_2
+```
+
+Example `Q_SWQ_FIT_3` conversion command:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+  --swq-fit-epochs 72 \
+  --swq-fit-residual-epochs 4 \
+  model-f16.gguf \
+  model-q-swq-fit-3.gguf \
+  Q_SWQ_FIT_3
+```
+
+`--swq-fit-progress` prints per-tensor epoch stats such as RMSE and relative
+RMSE while converting.
 
 Example inference command:
 

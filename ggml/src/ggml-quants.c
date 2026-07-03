@@ -12,6 +12,7 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <stdbool.h>
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -24,6 +25,21 @@
 #define GROUP_MAX_EPS_IQ1_S 1e-12f
 
 #define UNUSED GGML_UNUSED
+
+static int g_swq_fit_epochs = 72;
+static int g_swq_fit_residual_epochs = 4;
+static bool g_swq_fit_progress = false;
+static const char * g_swq_fit_tensor_name = NULL;
+
+void ggml_quantize_swq_fit_set_config(int fit_epochs, int residual_epochs, bool progress) {
+    g_swq_fit_epochs = fit_epochs > 0 ? fit_epochs : 1;
+    g_swq_fit_residual_epochs = residual_epochs > 0 ? residual_epochs : 1;
+    g_swq_fit_progress = progress;
+}
+
+void ggml_quantize_swq_fit_set_tensor_name(const char * tensor_name) {
+    g_swq_fit_tensor_name = tensor_name;
+}
 
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -171,6 +187,368 @@ void quantize_row_q_swq_4_ref(const float * GGML_RESTRICT x, block_q_swq_4 * GGM
         for (int j = 0; j < QK_SWQ_4 / 2; ++j) {
             y[i].qs[j] = indices[j] | (indices[j + QK_SWQ_4 / 2] << 4);
         }
+    }
+}
+
+static bool swq_fit_2_solve(float a[4][5], float coeffs[4]) {
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        float pivot_abs = fabsf(a[c][c]);
+        for (int r = c + 1; r < 4; ++r) {
+            const float v = fabsf(a[r][c]);
+            if (v > pivot_abs) {
+                pivot = r;
+                pivot_abs = v;
+            }
+        }
+        if (pivot_abs < 1e-12f) {
+            return false;
+        }
+        if (pivot != c) {
+            for (int j = c; j < 5; ++j) {
+                const float tmp = a[c][j];
+                a[c][j] = a[pivot][j];
+                a[pivot][j] = tmp;
+            }
+        }
+        const float inv = 1.0f / a[c][c];
+        for (int j = c; j < 5; ++j) {
+            a[c][j] *= inv;
+        }
+        for (int r = 0; r < 4; ++r) {
+            if (r == c) {
+                continue;
+            }
+            const float f = a[r][c];
+            for (int j = c; j < 5; ++j) {
+                a[r][j] -= f * a[c][j];
+            }
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        coeffs[i] = a[i][4];
+    }
+    return true;
+}
+
+static float swq_fit_2_eval(const float coeffs[4], int j) {
+    const float t = -1.0f + 2.0f * j / (QK_SWQ_FIT_2 - 1);
+    return coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * coeffs[3]));
+}
+
+static void swq_fit_2_fit_coeffs(const float * xb, const uint8_t * indices, const float residual_codebook[4], float coeffs[4]) {
+    float normal[4][5] = { { 0.0f } };
+    float mean = 0.0f;
+
+    for (int j = 0; j < QK_SWQ_FIT_2; ++j) {
+        const float residual = indices ? residual_codebook[indices[j]] : 0.0f;
+        const float target = xb[j] - residual;
+        mean += target;
+        const float t = -1.0f + 2.0f * j / (QK_SWQ_FIT_2 - 1);
+        const float p[4] = { 1.0f, t, t * t, t * t * t };
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                normal[r][c] += p[r] * p[c];
+            }
+            normal[r][4] += p[r] * target;
+        }
+    }
+
+    if (!swq_fit_2_solve(normal, coeffs)) {
+        coeffs[0] = mean / QK_SWQ_FIT_2;
+        coeffs[1] = 0.0f;
+        coeffs[2] = 0.0f;
+        coeffs[3] = 0.0f;
+    }
+}
+
+static void swq_fit_2_assign_residuals(const float * xb, const float coeffs[4], float residual_codebook[4], uint8_t indices[QK_SWQ_FIT_2]) {
+    float sums[4] = { 0.0f };
+    int counts[4] = { 0 };
+
+    for (int j = 0; j < QK_SWQ_FIT_2; ++j) {
+        const float r = xb[j] - swq_fit_2_eval(coeffs, j);
+        int best = 0;
+        float best_error = fabsf(r - residual_codebook[0]);
+        for (int c = 1; c < 4; ++c) {
+            const float error = fabsf(r - residual_codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        indices[j] = best;
+        sums[best] += r;
+        counts[best]++;
+    }
+    for (int c = 0; c < 4; ++c) {
+        if (counts[c] > 0) {
+            residual_codebook[c] = sums[c] / counts[c];
+        }
+    }
+}
+
+static double swq_fit_2_block_sse(const float * xb, const float coeffs[4], const float residual_codebook[4]) {
+    double sse = 0.0;
+    for (int j = 0; j < QK_SWQ_FIT_2; ++j) {
+        const float r = xb[j] - swq_fit_2_eval(coeffs, j);
+        float best_error = fabsf(r - residual_codebook[0]);
+        int best = 0;
+        for (int c = 1; c < 4; ++c) {
+            const float error = fabsf(r - residual_codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        const double diff = (double) xb[j] - (double) swq_fit_2_eval(coeffs, j) - (double) residual_codebook[best];
+        sse += diff * diff;
+    }
+    return sse;
+}
+
+// Experimental SWQ fit prototype: cubic fit plus a 2-bit residual codebook.
+void quantize_row_q_swq_fit_2_ref(const float * GGML_RESTRICT x, block_q_swq_fit_2 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_FIT_2 == 0);
+
+    const int n_fit_epochs = g_swq_fit_epochs;
+    const int n_residual_epochs = g_swq_fit_residual_epochs;
+    const int nb = k / QK_SWQ_FIT_2;
+    double * epoch_sse = g_swq_fit_progress ? (double *) calloc(n_fit_epochs, sizeof(double)) : NULL;
+    double total_orig2 = 0.0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_FIT_2;
+        float coeffs[4] = { 0.0f };
+        uint8_t indices[QK_SWQ_FIT_2] = { 0 };
+        swq_fit_2_fit_coeffs(xb, NULL, NULL, coeffs);
+
+        if (g_swq_fit_progress) {
+            for (int j = 0; j < QK_SWQ_FIT_2; ++j) {
+                total_orig2 += (double) xb[j] * (double) xb[j];
+            }
+        }
+
+        float residual_codebook[4];
+        float min = xb[0] - swq_fit_2_eval(coeffs, 0);
+        float max = min;
+        for (int j = 1; j < QK_SWQ_FIT_2; ++j) {
+            const float r = xb[j] - swq_fit_2_eval(coeffs, j);
+            min = MIN(min, r);
+            max = MAX(max, r);
+        }
+        for (int c = 0; c < 4; ++c) {
+            residual_codebook[c] = min + (max - min) * c / 3.0f;
+        }
+
+        for (int epoch = 0; epoch < n_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < n_residual_epochs; ++iteration) {
+                swq_fit_2_assign_residuals(xb, coeffs, residual_codebook, indices);
+            }
+            swq_fit_2_fit_coeffs(xb, indices, residual_codebook, coeffs);
+            if (epoch_sse) {
+                epoch_sse[epoch] += swq_fit_2_block_sse(xb, coeffs, residual_codebook);
+            }
+        }
+        swq_fit_2_assign_residuals(xb, coeffs, residual_codebook, indices);
+
+        for (int c = 0; c < 4; ++c) {
+            y[i].coeffs[c] = GGML_FP32_TO_FP16(coeffs[c]);
+        }
+
+        for (int c = 0; c < 4; ++c) {
+            y[i].residuals[c] = GGML_FP32_TO_FP16(residual_codebook[c]);
+        }
+        for (int j = 0; j < QK_SWQ_FIT_2 / 4; ++j) {
+            y[i].qs[j] = indices[4*j] | (indices[4*j + 1] << 2) | (indices[4*j + 2] << 4) | (indices[4*j + 3] << 6);
+        }
+    }
+
+    if (epoch_sse) {
+        const char * name = g_swq_fit_tensor_name ? g_swq_fit_tensor_name : "(unknown tensor)";
+        const double inv_n = 1.0 / (double) k;
+        const double rms = sqrt(total_orig2 * inv_n);
+        fprintf(stderr, "\nSWQ_FIT_2 epochs: tensor=%s blocks=%d fit_epochs=%d residual_epochs=%d\n",
+                name, nb, n_fit_epochs, n_residual_epochs);
+        for (int epoch = 0; epoch < n_fit_epochs; ++epoch) {
+            const double rmse = sqrt(epoch_sse[epoch] * inv_n);
+            const double rel_rmse = rmse / (rms + 1e-12);
+            fprintf(stderr, "  epoch %3d/%3d - rmse %.8g - rel_rmse %.8g\n",
+                    epoch + 1, n_fit_epochs, rmse, rel_rmse);
+        }
+        free(epoch_sse);
+    }
+}
+
+static float swq_fit_3_eval(const float coeffs[4], int j) {
+    const float t = -1.0f + 2.0f * j / (QK_SWQ_FIT_3 - 1);
+    return coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * coeffs[3]));
+}
+
+static void swq_fit_3_fit_coeffs(const float * xb, const uint8_t * indices, const float residual_codebook[8], float coeffs[4]) {
+    float normal[4][5] = { { 0.0f } };
+    float mean = 0.0f;
+
+    for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+        const float residual = indices ? residual_codebook[indices[j]] : 0.0f;
+        const float target = xb[j] - residual;
+        mean += target;
+        const float t = -1.0f + 2.0f * j / (QK_SWQ_FIT_3 - 1);
+        const float p[4] = { 1.0f, t, t * t, t * t * t };
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                normal[r][c] += p[r] * p[c];
+            }
+            normal[r][4] += p[r] * target;
+        }
+    }
+
+    if (!swq_fit_2_solve(normal, coeffs)) {
+        coeffs[0] = mean / QK_SWQ_FIT_3;
+        coeffs[1] = 0.0f;
+        coeffs[2] = 0.0f;
+        coeffs[3] = 0.0f;
+    }
+}
+
+static void swq_fit_3_assign_residuals(const float * xb, const float coeffs[4], float residual_codebook[8], uint8_t indices[QK_SWQ_FIT_3]) {
+    float sums[8] = { 0.0f };
+    int counts[8] = { 0 };
+
+    for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+        const float r = xb[j] - swq_fit_3_eval(coeffs, j);
+        int best = 0;
+        float best_error = fabsf(r - residual_codebook[0]);
+        for (int c = 1; c < 8; ++c) {
+            const float error = fabsf(r - residual_codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        indices[j] = best;
+        sums[best] += r;
+        counts[best]++;
+    }
+    for (int c = 0; c < 8; ++c) {
+        if (counts[c] > 0) {
+            residual_codebook[c] = sums[c] / counts[c];
+        }
+    }
+}
+
+static double swq_fit_3_block_sse(const float * xb, const float coeffs[4], const float residual_codebook[8]) {
+    double sse = 0.0;
+    for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+        const float r = xb[j] - swq_fit_3_eval(coeffs, j);
+        float best_error = fabsf(r - residual_codebook[0]);
+        int best = 0;
+        for (int c = 1; c < 8; ++c) {
+            const float error = fabsf(r - residual_codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        const double diff = (double) xb[j] - (double) swq_fit_3_eval(coeffs, j) - (double) residual_codebook[best];
+        sse += diff * diff;
+    }
+    return sse;
+}
+
+static void swq_fit_3_pack_indices(const uint8_t indices[QK_SWQ_FIT_3], uint8_t qs[QK_SWQ_FIT_3 * 3 / 8]) {
+    memset(qs, 0, QK_SWQ_FIT_3 * 3 / 8);
+    for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+        const int bit = 3 * j;
+        const int byte = bit / 8;
+        const int shift = bit % 8;
+        const uint8_t q = indices[j] & 0x07;
+        qs[byte] |= q << shift;
+        if (shift > 5) {
+            qs[byte + 1] |= q >> (8 - shift);
+        }
+    }
+}
+
+static uint8_t swq_fit_3_get_index(const uint8_t qs[QK_SWQ_FIT_3 * 3 / 8], int j) {
+    const int bit = 3 * j;
+    const int byte = bit / 8;
+    const int shift = bit % 8;
+    uint16_t v = qs[byte] >> shift;
+    if (shift > 5) {
+        v |= (uint16_t) qs[byte + 1] << (8 - shift);
+    }
+    return v & 0x07;
+}
+
+// Experimental SWQ fit prototype: cubic fit plus a 3-bit residual codebook.
+void quantize_row_q_swq_fit_3_ref(const float * GGML_RESTRICT x, block_q_swq_fit_3 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_FIT_3 == 0);
+
+    const int n_fit_epochs = g_swq_fit_epochs;
+    const int n_residual_epochs = g_swq_fit_residual_epochs;
+    const int nb = k / QK_SWQ_FIT_3;
+    double * epoch_sse = g_swq_fit_progress ? (double *) calloc(n_fit_epochs, sizeof(double)) : NULL;
+    double total_orig2 = 0.0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_FIT_3;
+        float coeffs[4] = { 0.0f };
+        uint8_t indices[QK_SWQ_FIT_3] = { 0 };
+        swq_fit_3_fit_coeffs(xb, NULL, NULL, coeffs);
+
+        if (g_swq_fit_progress) {
+            for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+                total_orig2 += (double) xb[j] * (double) xb[j];
+            }
+        }
+
+        float residual_codebook[8];
+        float min = xb[0] - swq_fit_3_eval(coeffs, 0);
+        float max = min;
+        for (int j = 1; j < QK_SWQ_FIT_3; ++j) {
+            const float r = xb[j] - swq_fit_3_eval(coeffs, j);
+            min = MIN(min, r);
+            max = MAX(max, r);
+        }
+        for (int c = 0; c < 8; ++c) {
+            residual_codebook[c] = min + (max - min) * c / 7.0f;
+        }
+
+        for (int epoch = 0; epoch < n_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < n_residual_epochs; ++iteration) {
+                swq_fit_3_assign_residuals(xb, coeffs, residual_codebook, indices);
+            }
+            swq_fit_3_fit_coeffs(xb, indices, residual_codebook, coeffs);
+            if (epoch_sse) {
+                epoch_sse[epoch] += swq_fit_3_block_sse(xb, coeffs, residual_codebook);
+            }
+        }
+        swq_fit_3_assign_residuals(xb, coeffs, residual_codebook, indices);
+
+        for (int c = 0; c < 4; ++c) {
+            y[i].coeffs[c] = GGML_FP32_TO_FP16(coeffs[c]);
+        }
+
+        for (int c = 0; c < 8; ++c) {
+            y[i].residuals[c] = GGML_FP32_TO_FP16(residual_codebook[c]);
+        }
+        swq_fit_3_pack_indices(indices, y[i].qs);
+    }
+
+    if (epoch_sse) {
+        const char * name = g_swq_fit_tensor_name ? g_swq_fit_tensor_name : "(unknown tensor)";
+        const double inv_n = 1.0 / (double) k;
+        const double rms = sqrt(total_orig2 * inv_n);
+        fprintf(stderr, "\nSWQ_FIT_3 epochs: tensor=%s blocks=%d fit_epochs=%d residual_epochs=%d\n",
+                name, nb, n_fit_epochs, n_residual_epochs);
+        for (int epoch = 0; epoch < n_fit_epochs; ++epoch) {
+            const double rmse = sqrt(epoch_sse[epoch] * inv_n);
+            const double rel_rmse = rmse / (rms + 1e-12);
+            fprintf(stderr, "  epoch %3d/%3d - rmse %.8g - rel_rmse %.8g\n",
+                    epoch + 1, n_fit_epochs, rmse, rel_rmse);
+        }
+        free(epoch_sse);
     }
 }
 
@@ -491,6 +869,44 @@ void dequantize_row_q_swq_4(const block_q_swq_4 * GGML_RESTRICT x, float * GGML_
         for (int j = 0; j < QK_SWQ_4 / 2; ++j) {
             y[i * QK_SWQ_4 + j] = GGML_FP16_TO_FP32(x[i].codebook[x[i].qs[j] & 0x0f]);
             y[i * QK_SWQ_4 + j + QK_SWQ_4 / 2] = GGML_FP16_TO_FP32(x[i].codebook[x[i].qs[j] >> 4]);
+        }
+    }
+}
+
+void dequantize_row_q_swq_fit_2(const block_q_swq_fit_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_FIT_2 == 0);
+
+    const int nb = k / QK_SWQ_FIT_2;
+    for (int i = 0; i < nb; ++i) {
+        float coeffs[4];
+        float residuals[4];
+        for (int c = 0; c < 4; ++c) {
+            coeffs[c] = GGML_FP16_TO_FP32(x[i].coeffs[c]);
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_FIT_2; ++j) {
+            const uint8_t q = (x[i].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            y[i * QK_SWQ_FIT_2 + j] = swq_fit_2_eval(coeffs, j) + residuals[q];
+        }
+    }
+}
+
+void dequantize_row_q_swq_fit_3(const block_q_swq_fit_3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_FIT_3 == 0);
+
+    const int nb = k / QK_SWQ_FIT_3;
+    for (int i = 0; i < nb; ++i) {
+        float coeffs[4];
+        float residuals[8];
+        for (int c = 0; c < 4; ++c) {
+            coeffs[c] = GGML_FP16_TO_FP32(x[i].coeffs[c]);
+        }
+        for (int c = 0; c < 8; ++c) {
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
+            const uint8_t q = swq_fit_3_get_index(x[i].qs, j);
+            y[i * QK_SWQ_FIT_3 + j] = swq_fit_3_eval(coeffs, j) + residuals[q];
         }
     }
 }
@@ -2149,6 +2565,18 @@ size_t quantize_q_swq_4(const float * GGML_RESTRICT src, void * GGML_RESTRICT ds
     GGML_UNUSED(quant_weights);
     quantize_row_q_swq_4_ref(src, dst, nrow * n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_4, n_per_row);
+}
+
+size_t quantize_q_swq_fit_2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_fit_2_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_FIT_2, n_per_row);
+}
+
+size_t quantize_q_swq_fit_3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_fit_3_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_FIT_3, n_per_row);
 }
 
 static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
@@ -5554,6 +5982,33 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 for (size_t i = 0; i < nb; ++i) {
                     for (size_t j = 0; j < 16; ++j) {
                         if (!validate_fp16(q[i].codebook[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_FIT_2:
+            {
+                const block_q_swq_fit_2 * q = (const block_q_swq_fit_2 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < 4; ++j) {
+                        if (!validate_fp16(q[i].coeffs[j], i) || !validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_FIT_3:
+            {
+                const block_q_swq_fit_3 * q = (const block_q_swq_fit_3 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < 4; ++j) {
+                        if (!validate_fp16(q[i].coeffs[j], i)) {
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < 8; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
                             return false;
                         }
                     }
