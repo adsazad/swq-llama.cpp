@@ -250,6 +250,36 @@ typedef struct {
 } block_q_swq_hfit_4_128;
 static_assert(sizeof(block_q_swq_hfit_4_128) == 112, "wrong q_swq_hfit_4_128 block size/padding");
 
+// Experimental piecewise-linear SWQ prototype: cheap line predictor plus 3-bit residual indices.
+#define QK_SWQ_PLIN3_128 128
+typedef struct {
+    ggml_half starts[4];
+    ggml_half slopes[4];
+    ggml_half residuals[8];
+    uint8_t qs[QK_SWQ_PLIN3_128 * 3 / 8];
+} block_q_swq_plin3_128;
+static_assert(sizeof(block_q_swq_plin3_128) == 80, "wrong q_swq_plin3_128 block size/padding");
+
+// Experimental piecewise-linear SWQ prototype: 4-bit residual indices for higher accuracy.
+#define QK_SWQ_PLIN4_128 128
+typedef struct {
+    ggml_half starts[4];
+    ggml_half slopes[4];
+    ggml_half residuals[16];
+    uint8_t qs[QK_SWQ_PLIN4_128 / 2];
+} block_q_swq_plin4_128;
+static_assert(sizeof(block_q_swq_plin4_128) == 112, "wrong q_swq_plin4_128 block size/padding");
+
+// Experimental piecewise-linear SWQ prototype: INT8 line params plus 3-bit residual indices.
+#define QK_SWQ_PLIN3Q_128 128
+typedef struct {
+    ggml_half d;
+    ggml_half residuals[8];
+    int8_t coeffs[8];
+    uint8_t qs[QK_SWQ_PLIN3Q_128 * 3 / 8];
+} block_q_swq_plin3q_128;
+static_assert(sizeof(block_q_swq_plin3q_128) == 74, "wrong q_swq_plin3q_128 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

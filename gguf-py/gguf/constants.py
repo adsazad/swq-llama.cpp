@@ -4539,6 +4539,9 @@ class GGMLQuantizationType(IntEnum):
     Q_SWQ_HFIT_3 = 45
     Q_SWQ_HFIT_3_128 = 46
     Q_SWQ_HFIT_4_128 = 47
+    Q_SWQ_PLIN3_128 = 48
+    Q_SWQ_PLIN4_128 = 49
+    Q_SWQ_PLIN3Q_128 = 50
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4725,6 +4728,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q_SWQ_HFIT_3: (256, 128),
     GGMLQuantizationType.Q_SWQ_HFIT_3_128: (128, 80),
     GGMLQuantizationType.Q_SWQ_HFIT_4_128: (128, 112),
+    GGMLQuantizationType.Q_SWQ_PLIN3_128: (128, 80),
+    GGMLQuantizationType.Q_SWQ_PLIN4_128: (128, 112),
+    GGMLQuantizationType.Q_SWQ_PLIN3Q_128: (128, 74),
 }
 
 

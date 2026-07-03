@@ -189,6 +189,65 @@ Quant size:                    550.41 MiB
 Quant BPW:                       7.33
 ```
 
+`Q_SWQ_PLIN3_128`, `Q_SWQ_PLIN4_128`, and `Q_SWQ_PLIN3Q_128` are the next
+piecewise-linear experiments. They keep the low-RAM design, but replace cubic
+weight reconstruction with four 32-weight line segments per 128-weight block.
+
+The key runtime idea is:
+
+```text
+w_i = start + slope*i + residual
+
+dot(x, w) =
+  start * sum(x)
+  + slope * sum(i*x)
+  + sum(x*residual)
+```
+
+That means the equation part is handled with segment sums instead of rebuilding
+every predicted weight. Only the residual codebook lookup remains per weight.
+
+The new formats are:
+
+| Format | Structure | Raw bytes / 128 weights | Raw bpw | Goal |
+|---|---|---:|---:|---|
+| Q_SWQ_PLIN3_128 | FP16 line params, 8 FP16 residuals, 3-bit indices | 80 | 5.0 | same size as HFIT3-128, cheaper math |
+| Q_SWQ_PLIN4_128 | FP16 line params, 16 FP16 residuals, 4-bit indices | 112 | 7.0 | same size as HFIT4-128, better residual accuracy |
+| Q_SWQ_PLIN3Q_128 | INT8 line params, one FP16 scale, 8 FP16 residuals, 3-bit indices | 74 | 4.625 | smaller than HFIT3-128, possible accuracy loss |
+
+These PLIN formats are implemented as experimental conversion, loading, memory
+reporting, dequantization, and CPU dot-product paths.
+
+Initial Qwen2.5 0.5B tests used:
+
+```text
+./build/bin/llama-quantize --swq-stats --swq-fit-epochs 6 --swq-fit-residual-epochs 2 ...
+/usr/bin/time -l ./build/bin/llama-completion -p "The capital of India is" -n 16 -t 4 --temp 0 --no-display-prompt -no-cnv
+```
+
+| Model | File size | Peak RAM | Eval speed | Smoke output quality |
+|---|---:|---:|---:|---|
+| Q8_0 | 644.41 MiB | 1,178,222,592 bytes | 26.75 t/s | coherent |
+| Q_SWQ_HFIT_3_128 | 438.31 MiB | 649,510,912 bytes | 0.91 t/s | weak |
+| Q_SWQ_HFIT_4_128 | 556.08 MiB | 792,035,328 bytes | 1.68 t/s | coherent |
+| Q_SWQ_PLIN3_128 | 438.31 MiB | 656,097,280 bytes | 1.16 t/s | weak but mentions New Delhi |
+| Q_SWQ_PLIN4_128 | 556.08 MiB | 783,269,888 bytes | 1.09 t/s | coherent but question-like |
+| Q_SWQ_PLIN3Q_128 | 416.23 MiB | 631,259,136 bytes | 1.19 t/s | repetitive but mentions Delhi |
+
+`Q_SWQ_PLIN3Q_128` is the smallest tested full-model runtime format so far:
+
+```text
+File saved vs Q8_0: 228.18 MiB
+Peak RAM saved vs Q8_0: 521.62 MiB
+Peak RAM saved vs Q8_0: 46.42%
+```
+
+The PLIN result is useful but not fast enough. The dot-product identity reduced
+the equation cost, but the scalar residual lookup and nonstandard kernel still
+leave full-model speed far below the 10 t/s target. `Q_SWQ_HFIT_4_128` remains
+the fastest full-model SWQ-family result in this set, while selective Q8_0 plus
+SWQ on fewer tensors remains the only tested path above 10 t/s.
+
 The current research status is:
 
 ```text
@@ -197,6 +256,9 @@ Q_SWQ_FIT_2: very small, but too inaccurate.
 Q_SWQ_FIT_3: better quality, still too slow.
 Q_SWQ_HFIT_3_128: best RAM-saving runtime HFIT result, still too slow.
 Q_SWQ_HFIT_4_128: faster than HFIT3-128, but larger and still too slow.
+Q_SWQ_PLIN3_128: same size as HFIT3-128, slightly faster than HFIT3-128, still too slow.
+Q_SWQ_PLIN4_128: same size as HFIT4-128, slower than HFIT4-128.
+Q_SWQ_PLIN3Q_128: smallest full-model runtime result so far, still too slow.
 Q8_0 + selective SWQ128 K/V: current usable local tradeoff above 10 t/s.
 ```
 
@@ -208,6 +270,88 @@ An earlier attempt appeared to produce truncated responses because several
 `llama-cli` processes remained active after the command-output wrapper returned.
 Those results are not used above. The corrected measurements poll one process
 until it exits before starting the next model.
+
+### Configurable HFIT4 mixed-format follow-up
+
+`llama-quantize` can assign different quantization types to tensors through a
+regular-expression configuration file. A follow-up compared full
+`Q_SWQ_HFIT_4_128` against this three-tier profile:
+
+```text
+token embedding and output: Q8_0
+attention weights:           Q5_0
+FFN gate/up/down weights:     Q_SWQ_HFIT_4_128
+```
+
+The profile file contained:
+
+```text
+\.attn_(q|k|v|output)\.weight=q5_0
+\.ffn_(gate|up|down)\.weight=q_swq_hfit_4_128
+```
+
+The Q5_0 block size is 32, so it is compatible with the Qwen row widths that
+prevented a standard 256-weight HFIT block. The model was converted with Q8_0
+as the default and explicit Q8_0 embedding and output types:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+  --swq-fit-epochs 6 \
+  --swq-fit-residual-epochs 2 \
+  --tensor-type-file models/swq/tensor-types-hfit4-smart.txt \
+  --output-tensor-type q8_0 \
+  --token-embedding-type q8_0 \
+  model-f16.gguf \
+  model-q8-q5-hfit4-smart.gguf \
+  Q8_0
+```
+
+Both models used four threads, temperature 0, and the same deterministic
+prompts. File and RAM measurements came from completed runs. The factual speed
+pair used the same 16-token smoke shape; the reasoning pair used the same
+64-token arithmetic prompt.
+
+| Metric | HFIT4-128 on all eligible tensors | Q8_0 + Q5_0 + HFIT4-128 |
+|---|---:|---:|
+| File size | 556.08 MiB | 572.55 MiB |
+| Peak RSS | 787,857,408 bytes | 793,247,744 bytes |
+| Factual generation | 3.68 t/s | 3.67 t/s |
+| Arithmetic generation | 2.52 t/s | 2.71 t/s |
+| Factual output | correct and direct | correct option, but changed to multiple choice |
+| Longer output | repetitive | unrelated or unstable |
+
+```mermaid
+xychart-beta
+    title "Model file size"
+    x-axis [HFIT4_all, Mixed]
+    y-axis "MiB" 0 --> 650
+    bar [556.08, 572.55]
+```
+
+```mermaid
+xychart-beta
+    title "Peak resident memory"
+    x-axis [HFIT4_all, Mixed]
+    y-axis "MB" 0 --> 900
+    bar [787.9, 793.2]
+```
+
+```mermaid
+xychart-beta
+    title "Generation speed by prompt"
+    x-axis [HFIT4_factual, Mixed_factual, HFIT4_arithmetic, Mixed_arithmetic]
+    y-axis "tokens per second" 0 --> 4
+    bar [3.68, 3.67, 2.52, 2.71]
+```
+
+The mixed profile improved arithmetic generation by about 7.5%, but did not
+improve factual generation, increased file size and peak RSS, and made the
+factual response less direct. A 96-token pair was interrupted before timing
+completed. A replacement long run encountered a severe host slowdown, so no
+long-form speed claim is made. The partial text still showed that neither model
+was reliable for longer generation. Full HFIT4-128 therefore remains the better
+result in this follow-up; future mixed profiles need tensor sensitivity evidence
+rather than only tensor-category rules.
 
 Example mixed conversion command:
 

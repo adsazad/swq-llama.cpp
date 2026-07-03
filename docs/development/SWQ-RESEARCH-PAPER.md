@@ -484,6 +484,68 @@ can preserve grammar and simple instruction following, but one correct factual
 completion does not establish reasoning accuracy. The arithmetic failure is a
 clear counterexample.
 
+### 7.13 Configurable HFIT4 layer-mixed follow-up
+
+A later follow-up used the existing `--tensor-type-file` mechanism to test a
+category-aware mixed model without adding another GGML storage type. The
+configuration kept token embeddings and the output tensor in Q8_0, assigned
+Q5_0 to attention Q/K/V/output weights, and assigned `Q_SWQ_HFIT_4_128` to FFN
+gate/up/down weights in every transformer layer.
+
+```text
+\.attn_(q|k|v|output)\.weight=q5_0
+\.ffn_(gate|up|down)\.weight=q_swq_hfit_4_128
+```
+
+Q5_0 was selected for the attention portion because its 32-weight block divides
+the tested Qwen row widths. This avoids the row-layout incompatibility found in
+the 256-weight hierarchical experiment.
+
+| Metric | HFIT4-128 on all eligible tensors | Q8_0 + Q5_0 + HFIT4-128 |
+|---|---:|---:|
+| File size | 556.08 MiB | 572.55 MiB |
+| Peak RSS | 787,857,408 bytes | 793,247,744 bytes |
+| Factual generation | 3.68 t/s | 3.67 t/s |
+| Arithmetic generation | 2.52 t/s | 2.71 t/s |
+
+```mermaid
+xychart-beta
+    title "HFIT4 mixed-profile storage"
+    x-axis [HFIT4_all, Mixed]
+    y-axis "MiB" 0 --> 650
+    bar [556.08, 572.55]
+```
+
+```mermaid
+xychart-beta
+    title "HFIT4 mixed-profile peak RSS"
+    x-axis [HFIT4_all, Mixed]
+    y-axis "MB" 0 --> 900
+    bar [787.9, 793.2]
+```
+
+```mermaid
+xychart-beta
+    title "HFIT4 mixed-profile generation speed"
+    x-axis [HFIT4_fact, Mixed_fact, HFIT4_math, Mixed_math]
+    y-axis "tokens per second" 0 --> 4
+    bar [3.68, 3.67, 2.52, 2.71]
+```
+
+Both models answered the short factual prompt with New Delhi. Full HFIT4 gave a
+direct completion, while the mixed model reformatted the answer as an
+unrequested multiple-choice question. Both arithmetic outputs were structured
+and coherent within the token limit. In longer generation, full HFIT4 became
+repetitive and the mixed model produced unrelated multiple-choice text.
+
+The 96-token timing pair was interrupted before completion. A replacement run
+encountered a large host slowdown, from several tokens/sec to 0.46 tokens/sec,
+so it was excluded from the speed comparison. The valid paired measurements
+show a 7.5% arithmetic-speed improvement for the mixed profile, but effectively
+no factual-speed improvement. The mixed model was also 16.47 MiB larger and
+used about 5.4 MB more peak RSS. This category-only assignment therefore did
+not improve the overall HFIT4 tradeoff.
+
 ## 8. Interactive graphs and layer reports
 
 The repository contains detailed HTML reports with downsampled original and
@@ -554,6 +616,15 @@ Q8_0 plus SWQ128 on attention K/V tensors is the only tested SWQ configuration
 that exceeds 10 generation tokens/sec while reducing measured peak RAM. It
 saves only 54.02 MiB relative to Q8_0, but it is the current practical result.
 
+### Finding 7: tensor-category mixing is not enough
+
+The configurable Q8_0/Q5_0/HFIT4 profile demonstrates that different tensor
+types and block sizes can coexist in one GGUF model. However, replacing all
+attention weights with Q5_0 did not reduce RAM or improve factual generation
+relative to full HFIT4, and qualitative stability became worse. A useful mixed
+profile needs layer- or tensor-sensitivity measurements, not only names such as
+attention and FFN.
+
 ## 10. Threats to validity
 
 This study has important limitations:
@@ -569,6 +640,8 @@ This study has important limitations:
 - a 64-token cap truncated some otherwise continuing answers;
 - reconstruction RMSE does not directly predict language-model accuracy;
 - mixed formats were not exhaustively searched layer by layer.
+- the HFIT4 mixed follow-up used a small prompt set, and its long timing run was
+  invalidated by interruption and host slowdown.
 
 These constraints prevent a claim that SWQ is better than established llama.cpp
 quantization formats.
@@ -691,6 +764,13 @@ The project is therefore onto a real compression mechanism, but not yet a
 competitive general-purpose quantization format. The next decisive evidence is
 perplexity and task evaluation, and the next decisive engineering step is a
 vectorized ARM CPU kernel.
+
+The configurable HFIT4 follow-up also shows that format mixing itself is not a
+solution. The Q8_0/Q5_0/HFIT4 model was slightly faster on one arithmetic
+prompt, but it was larger, used more peak RAM, and was less stable on factual
+and longer text. Full HFIT4-128 remained the better result in that comparison.
+Future hybrid work should assign formats from measured tensor sensitivity and
+task-level quality, then optimize the HFIT4 reconstruction kernel.
 
 ## Appendix A. Primary recorded artifacts
 

@@ -965,6 +965,72 @@ still far slower than Q8_0. It also gives up much of the RAM gain: the file is
 shows that 4-bit indices help, but the dominant runtime cost is still computing
 equation-derived weights during the dot product.
 
+## Runtime PLIN experiments
+
+`Q_SWQ_PLIN3_128`, `Q_SWQ_PLIN4_128`, and `Q_SWQ_PLIN3Q_128` were added to test
+a cheaper piecewise-linear predictor. Each 128-weight block is split into four
+32-weight line segments. The dot kernel uses the separable line form:
+
+```text
+w_i = start + slope*i + residual
+dot(x, w) = start * sum(x) + slope * sum(i*x) + sum(x*residual)
+```
+
+So the line part is handled through segment sums. Only residual lookup remains
+per weight.
+
+Conversion commands used 6 fit epochs and 2 residual epochs:
+
+```text
+./build/bin/llama-quantize --swq-stats --swq-fit-epochs 6 --swq-fit-residual-epochs 2 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-plin3-128-e6.gguf \
+    Q_SWQ_PLIN3_128
+```
+
+The same command shape was used for `Q_SWQ_PLIN4_128` and
+`Q_SWQ_PLIN3Q_128`.
+
+Conversion result:
+
+| Format | File size | Quant size | SWQ tensor bytes | Ratio | Saved |
+|---|---:|---:|---:|---:|---:|
+| Q_SWQ_PLIN3_128 | 438.31 MiB | 432.64 MiB | 453,655,040 | 2.78x | 64.01% |
+| Q_SWQ_PLIN4_128 | 556.08 MiB | 550.41 MiB | 577,145,344 | 2.18x | 54.21% |
+| Q_SWQ_PLIN3Q_128 | 416.23 MiB | 410.56 MiB | 430,500,608 | 2.93x | 65.85% |
+
+Smoke command:
+
+```text
+/usr/bin/time -l ./build/bin/llama-completion \
+    -m <model.gguf> \
+    -p "The capital of India is" \
+    -n 16 \
+    -t 4 \
+    --temp 0 \
+    --no-display-prompt \
+    -no-cnv
+```
+
+Smoke result:
+
+| Model | File size | Output | Max RSS | Prompt eval | Generation |
+|---|---:|---|---:|---:|---:|
+| Q8_0 | 644.41 MiB | `India is located` | 1,178,222,592 bytes | 141.81 t/s | 26.75 t/s |
+| HFIT3-128 e6 | 438.31 MiB | `A` | 649,510,912 bytes | 1.08 t/s | 0.91 t/s |
+| HFIT4-128 e6 | 556.08 MiB | `New Delhi...` | 792,035,328 bytes | 1.99 t/s | 1.68 t/s |
+| PLIN3-128 e6 | 438.31 MiB | `A. New Delhi...` | 656,097,280 bytes | 1.40 t/s | 1.16 t/s |
+| PLIN4-128 e6 | 556.08 MiB | `New Delhi...` | 783,269,888 bytes | 1.37 t/s | 1.09 t/s |
+| PLIN3Q-128 e6 | 416.23 MiB | `the capital of India...Delhi...` | 631,259,136 bytes | 1.41 t/s | 1.19 t/s |
+
+Result:
+
+- `Q_SWQ_PLIN3Q_128` is the smallest full-model runtime SWQ result so far.
+- It saved 228.18 MiB file size and 521.62 MiB peak RSS versus Q8_0.
+- Its peak-RSS saving versus Q8_0 was 46.42%.
+- PLIN improved over HFIT3 at the same block size, but did not beat HFIT4 speed.
+- None of the full-model PLIN variants are close to the 10 t/s target.
+
 ## Raw logs
 
 - `models/swq/conversion.log`

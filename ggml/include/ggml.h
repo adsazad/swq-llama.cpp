@@ -435,7 +435,10 @@ extern "C" {
         GGML_TYPE_Q_SWQ_HFIT_3 = 45, // experimental: hierarchical INT8 cubic fit plus anchors
         GGML_TYPE_Q_SWQ_HFIT_3_128 = 46, // experimental: row-compatible hierarchical INT8 cubic fit
         GGML_TYPE_Q_SWQ_HFIT_4_128 = 47, // experimental: 4-bit hierarchical INT8 cubic fit
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_Q_SWQ_PLIN3_128 = 48, // experimental: piecewise-linear fit plus 3-bit residuals
+        GGML_TYPE_Q_SWQ_PLIN4_128 = 49, // experimental: piecewise-linear fit plus 4-bit residuals
+        GGML_TYPE_Q_SWQ_PLIN3Q_128 = 50, // experimental: INT8 piecewise-linear fit plus 3-bit residuals
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision
@@ -485,6 +488,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q_SWQ_HFIT_3 = 31, // experimental, except 1d tensors
         GGML_FTYPE_MOSTLY_Q_SWQ_HFIT_3_128 = 32, // experimental, except 1d tensors
         GGML_FTYPE_MOSTLY_Q_SWQ_HFIT_4_128 = 33, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_PLIN3_128 = 34, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_PLIN4_128 = 35, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_PLIN3Q_128 = 36, // experimental, except 1d tensors
     };
 
     // available tensor operations:

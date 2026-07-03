@@ -44,6 +44,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3:  name = LLAMA_FTYPE_PREFIX "Q_SWQ_HFIT_3 (experimental)"; break;
         case LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3_128: name = LLAMA_FTYPE_PREFIX "Q_SWQ_HFIT_3_128 (experimental)"; break;
         case LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_4_128: name = LLAMA_FTYPE_PREFIX "Q_SWQ_HFIT_4_128 (experimental)"; break;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_PLIN3_128: name = LLAMA_FTYPE_PREFIX "Q_SWQ_PLIN3_128 (experimental)"; break;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_PLIN4_128: name = LLAMA_FTYPE_PREFIX "Q_SWQ_PLIN4_128 (experimental)"; break;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_PLIN3Q_128: name = LLAMA_FTYPE_PREFIX "Q_SWQ_PLIN3Q_128 (experimental)"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
@@ -758,6 +761,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q_SWQ_HFIT_3:  ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3; break;
             case GGML_TYPE_Q_SWQ_HFIT_3_128: ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3_128; break;
             case GGML_TYPE_Q_SWQ_HFIT_4_128: ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_4_128; break;
+            case GGML_TYPE_Q_SWQ_PLIN3_128: ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_PLIN3_128; break;
+            case GGML_TYPE_Q_SWQ_PLIN4_128: ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_PLIN4_128; break;
+            case GGML_TYPE_Q_SWQ_PLIN3Q_128: ftype = LLAMA_FTYPE_MOSTLY_Q_SWQ_PLIN3Q_128; break;
             case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
             case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
             case GGML_TYPE_Q5_1:    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;    break;
@@ -1727,7 +1733,7 @@ void llama_model_loader::print_info() const {
         LLAMA_LOG_INFO("%-40s %-10s %14s %14s %14s %9s\n", "tensor", "original", "original bytes", "SWQ bytes", "saved bytes", "ratio");
         for (const auto & item : weights_map) {
             const ggml_tensor * tensor = item.second.tensor;
-            if (tensor->type != GGML_TYPE_Q_SWQ_4 && tensor->type != GGML_TYPE_Q_SWQ_FIT_2 && tensor->type != GGML_TYPE_Q_SWQ_FIT_3 && tensor->type != GGML_TYPE_Q_SWQ_HFIT_3 && tensor->type != GGML_TYPE_Q_SWQ_HFIT_3_128 && tensor->type != GGML_TYPE_Q_SWQ_HFIT_4_128) {
+            if (tensor->type != GGML_TYPE_Q_SWQ_4 && tensor->type != GGML_TYPE_Q_SWQ_FIT_2 && tensor->type != GGML_TYPE_Q_SWQ_FIT_3 && tensor->type != GGML_TYPE_Q_SWQ_HFIT_3 && tensor->type != GGML_TYPE_Q_SWQ_HFIT_3_128 && tensor->type != GGML_TYPE_Q_SWQ_HFIT_4_128 && tensor->type != GGML_TYPE_Q_SWQ_PLIN3_128 && tensor->type != GGML_TYPE_Q_SWQ_PLIN4_128 && tensor->type != GGML_TYPE_Q_SWQ_PLIN3Q_128) {
                 continue;
             }
             const size_t tensor_original = ggml_nelements(tensor) * sizeof(ggml_fp16_t);

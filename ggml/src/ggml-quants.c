@@ -954,6 +954,191 @@ void quantize_row_q_swq_hfit_4_128_ref(const float * GGML_RESTRICT x, block_q_sw
     }
 }
 
+static float swq_plin_predict(const float starts[4], const float slopes[4], int j) {
+    const int segment = j / 32;
+    const int local = j % 32;
+    return starts[segment] + slopes[segment] * local;
+}
+
+static void swq_plin_fit_lines(const float * xb, const uint8_t * indices, const float * codebook, int ncode, float starts[4], float slopes[4]) {
+    GGML_UNUSED(ncode);
+    const float n = 32.0f;
+    const float sum_x = 496.0f;
+    const float sum_x2 = 10416.0f;
+    const float denom = n * sum_x2 - sum_x * sum_x;
+    for (int segment = 0; segment < 4; ++segment) {
+        float sum_y = 0.0f;
+        float sum_xy = 0.0f;
+        for (int local = 0; local < 32; ++local) {
+            const int j = segment * 32 + local;
+            const float correction = indices ? codebook[indices[j]] : 0.0f;
+            const float target = xb[j] - correction;
+            sum_y += target;
+            sum_xy += local * target;
+        }
+        slopes[segment] = (n * sum_xy - sum_x * sum_y) / denom;
+        starts[segment] = (sum_y - slopes[segment] * sum_x) / n;
+    }
+}
+
+static void swq_plin_assign_residuals(const float * xb, const float starts[4], const float slopes[4], float * codebook, uint8_t * indices, int ncode) {
+    float sums[16] = { 0.0f };
+    int counts[16] = { 0 };
+    for (int j = 0; j < QK_SWQ_PLIN3_128; ++j) {
+        const float residual = xb[j] - swq_plin_predict(starts, slopes, j);
+        int best = 0;
+        float best_error = fabsf(residual - codebook[0]);
+        for (int c = 1; c < ncode; ++c) {
+            const float error = fabsf(residual - codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        indices[j] = best;
+        sums[best] += residual;
+        counts[best]++;
+    }
+    for (int c = 0; c < ncode; ++c) {
+        if (counts[c] > 0) {
+            codebook[c] = sums[c] / counts[c];
+        }
+    }
+}
+
+static void swq_plin_init_codebook(const float * xb, const float starts[4], const float slopes[4], float * codebook, int ncode) {
+    float min = xb[0] - swq_plin_predict(starts, slopes, 0);
+    float max = min;
+    for (int j = 1; j < QK_SWQ_PLIN3_128; ++j) {
+        const float residual = xb[j] - swq_plin_predict(starts, slopes, j);
+        min = MIN(min, residual);
+        max = MAX(max, residual);
+    }
+    for (int c = 0; c < ncode; ++c) {
+        codebook[c] = min + (max - min) * c / (float) (ncode - 1);
+    }
+}
+
+static float swq_plin_quantize_lines(const float starts[4], const float slopes[4], int8_t coeffs[8]) {
+    float max_abs = 0.0f;
+    for (int c = 0; c < 4; ++c) {
+        max_abs = MAX(max_abs, fabsf(starts[c]));
+        max_abs = MAX(max_abs, fabsf(slopes[c]));
+    }
+    const float d = max_abs > 0.0f ? max_abs / 127.0f : 0.0f;
+    for (int c = 0; c < 4; ++c) {
+        coeffs[2 * c] = d > 0.0f ? (int8_t) MAX(-127, MIN(127, (int) lrintf(starts[c] / d))) : 0;
+        coeffs[2 * c + 1] = d > 0.0f ? (int8_t) MAX(-127, MIN(127, (int) lrintf(slopes[c] / d))) : 0;
+    }
+    return d;
+}
+
+// Experimental piecewise-linear SWQ: FP16 line params plus 3-bit residual indices.
+void quantize_row_q_swq_plin3_128_ref(const float * GGML_RESTRICT x, block_q_swq_plin3_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_PLIN3_128 == 0);
+    const int nb = k / QK_SWQ_PLIN3_128;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_PLIN3_128;
+        float starts[4];
+        float slopes[4];
+        float codebook[8];
+        uint8_t indices[QK_SWQ_PLIN3_128] = { 0 };
+
+        swq_plin_fit_lines(xb, NULL, NULL, 8, starts, slopes);
+        swq_plin_init_codebook(xb, starts, slopes, codebook, 8);
+        for (int epoch = 0; epoch < g_swq_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < g_swq_fit_residual_epochs; ++iteration) {
+                swq_plin_assign_residuals(xb, starts, slopes, codebook, indices, 8);
+            }
+            swq_plin_fit_lines(xb, indices, codebook, 8, starts, slopes);
+        }
+        swq_plin_assign_residuals(xb, starts, slopes, codebook, indices, 8);
+
+        for (int c = 0; c < 4; ++c) {
+            y[i].starts[c] = GGML_FP32_TO_FP16(starts[c]);
+            y[i].slopes[c] = GGML_FP32_TO_FP16(slopes[c]);
+        }
+        for (int c = 0; c < 8; ++c) {
+            y[i].residuals[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        swq_hfit_3_128_pack_indices(indices, y[i].qs);
+    }
+}
+
+// Experimental piecewise-linear SWQ: FP16 line params plus 4-bit residual indices.
+void quantize_row_q_swq_plin4_128_ref(const float * GGML_RESTRICT x, block_q_swq_plin4_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_PLIN4_128 == 0);
+    const int nb = k / QK_SWQ_PLIN4_128;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_PLIN4_128;
+        float starts[4];
+        float slopes[4];
+        float codebook[16];
+        uint8_t indices[QK_SWQ_PLIN4_128] = { 0 };
+
+        swq_plin_fit_lines(xb, NULL, NULL, 16, starts, slopes);
+        swq_plin_init_codebook(xb, starts, slopes, codebook, 16);
+        for (int epoch = 0; epoch < g_swq_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < g_swq_fit_residual_epochs; ++iteration) {
+                swq_plin_assign_residuals(xb, starts, slopes, codebook, indices, 16);
+            }
+            swq_plin_fit_lines(xb, indices, codebook, 16, starts, slopes);
+        }
+        swq_plin_assign_residuals(xb, starts, slopes, codebook, indices, 16);
+
+        for (int c = 0; c < 4; ++c) {
+            y[i].starts[c] = GGML_FP32_TO_FP16(starts[c]);
+            y[i].slopes[c] = GGML_FP32_TO_FP16(slopes[c]);
+        }
+        for (int c = 0; c < 16; ++c) {
+            y[i].residuals[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        for (int j = 0; j < QK_SWQ_PLIN4_128 / 2; ++j) {
+            y[i].qs[j] = (indices[2 * j] & 0x0f) | ((indices[2 * j + 1] & 0x0f) << 4);
+        }
+    }
+}
+
+// Experimental piecewise-linear SWQ: INT8 line params plus 3-bit residual indices.
+void quantize_row_q_swq_plin3q_128_ref(const float * GGML_RESTRICT x, block_q_swq_plin3q_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_PLIN3Q_128 == 0);
+    const int nb = k / QK_SWQ_PLIN3Q_128;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_PLIN3Q_128;
+        float starts[4];
+        float slopes[4];
+        float qstarts[4];
+        float qslopes[4];
+        float codebook[8];
+        uint8_t indices[QK_SWQ_PLIN3Q_128] = { 0 };
+        int8_t coeffs[8];
+
+        swq_plin_fit_lines(xb, NULL, NULL, 8, starts, slopes);
+        swq_plin_init_codebook(xb, starts, slopes, codebook, 8);
+        for (int epoch = 0; epoch < g_swq_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < g_swq_fit_residual_epochs; ++iteration) {
+                swq_plin_assign_residuals(xb, starts, slopes, codebook, indices, 8);
+            }
+            swq_plin_fit_lines(xb, indices, codebook, 8, starts, slopes);
+        }
+
+        const float d = swq_plin_quantize_lines(starts, slopes, coeffs);
+        for (int c = 0; c < 4; ++c) {
+            qstarts[c] = d * coeffs[2 * c];
+            qslopes[c] = d * coeffs[2 * c + 1];
+        }
+        swq_plin_init_codebook(xb, qstarts, qslopes, codebook, 8);
+        swq_plin_assign_residuals(xb, qstarts, qslopes, codebook, indices, 8);
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int c = 0; c < 8; ++c) {
+            y[i].coeffs[c] = coeffs[c];
+            y[i].residuals[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        swq_hfit_3_128_pack_indices(indices, y[i].qs);
+    }
+}
+
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
     const int qk = QK4_1;
 
@@ -1374,6 +1559,70 @@ void dequantize_row_q_swq_hfit_4_128(const block_q_swq_hfit_4_128 * GGML_RESTRIC
         }
         for (int anchor = 0; anchor < 2; ++anchor) {
             y[i * QK_SWQ_HFIT_4_128 + x[i].anchor_pos[anchor]] = GGML_FP16_TO_FP32(x[i].anchors[anchor]);
+        }
+    }
+}
+
+void dequantize_row_q_swq_plin3_128(const block_q_swq_plin3_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_PLIN3_128 == 0);
+    const int nb = k / QK_SWQ_PLIN3_128;
+    for (int i = 0; i < nb; ++i) {
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int segment = 0; segment < 4; ++segment) {
+            float line = GGML_FP16_TO_FP32(x[i].starts[segment]);
+            const float slope = GGML_FP16_TO_FP32(x[i].slopes[segment]);
+            for (int local = 0; local < 32; ++local) {
+                const int j = segment * 32 + local;
+                const uint8_t q = swq_hfit_3_128_get_index(x[i].qs, j);
+                y[i * QK_SWQ_PLIN3_128 + j] = line + residuals[q];
+                line += slope;
+            }
+        }
+    }
+}
+
+void dequantize_row_q_swq_plin4_128(const block_q_swq_plin4_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_PLIN4_128 == 0);
+    const int nb = k / QK_SWQ_PLIN4_128;
+    for (int i = 0; i < nb; ++i) {
+        float residuals[16];
+        for (int c = 0; c < 16; ++c) {
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int segment = 0; segment < 4; ++segment) {
+            float line = GGML_FP16_TO_FP32(x[i].starts[segment]);
+            const float slope = GGML_FP16_TO_FP32(x[i].slopes[segment]);
+            for (int local = 0; local < 32; ++local) {
+                const int j = segment * 32 + local;
+                const uint8_t q = (x[i].qs[j / 2] >> (4 * (j & 1))) & 0x0f;
+                y[i * QK_SWQ_PLIN4_128 + j] = line + residuals[q];
+                line += slope;
+            }
+        }
+    }
+}
+
+void dequantize_row_q_swq_plin3q_128(const block_q_swq_plin3q_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_PLIN3Q_128 == 0);
+    const int nb = k / QK_SWQ_PLIN3Q_128;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int segment = 0; segment < 4; ++segment) {
+            float line = d * x[i].coeffs[2 * segment];
+            const float slope = d * x[i].coeffs[2 * segment + 1];
+            for (int local = 0; local < 32; ++local) {
+                const int j = segment * 32 + local;
+                const uint8_t q = swq_hfit_3_128_get_index(x[i].qs, j);
+                y[i * QK_SWQ_PLIN3Q_128 + j] = line + residuals[q];
+                line += slope;
+            }
         }
     }
 }
@@ -3062,6 +3311,24 @@ size_t quantize_q_swq_hfit_4_128(const float * GGML_RESTRICT src, void * GGML_RE
     GGML_UNUSED(quant_weights);
     quantize_row_q_swq_hfit_4_128_ref(src, dst, nrow * n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_HFIT_4_128, n_per_row);
+}
+
+size_t quantize_q_swq_plin3_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_plin3_128_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_PLIN3_128, n_per_row);
+}
+
+size_t quantize_q_swq_plin4_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_plin4_128_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_PLIN4_128, n_per_row);
+}
+
+size_t quantize_q_swq_plin3q_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_plin3q_128_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_PLIN3Q_128, n_per_row);
 }
 
 static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
@@ -6551,6 +6818,52 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                     }
                     for (size_t j = 0; j < 2; ++j) {
                         if (!validate_fp16(q[i].anchors[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_PLIN3_128:
+            {
+                const block_q_swq_plin3_128 * q = (const block_q_swq_plin3_128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < 4; ++j) {
+                        if (!validate_fp16(q[i].starts[j], i) || !validate_fp16(q[i].slopes[j], i)) {
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < 8; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_PLIN4_128:
+            {
+                const block_q_swq_plin4_128 * q = (const block_q_swq_plin4_128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < 4; ++j) {
+                        if (!validate_fp16(q[i].starts[j], i) || !validate_fp16(q[i].slopes[j], i)) {
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < 16; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_PLIN3Q_128:
+            {
+                const block_q_swq_plin3q_128 * q = (const block_q_swq_plin3q_128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i)) {
+                        return false;
+                    }
+                    for (size_t j = 0; j < 8; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
                             return false;
                         }
                     }

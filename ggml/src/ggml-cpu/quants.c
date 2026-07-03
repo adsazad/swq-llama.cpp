@@ -54,6 +54,18 @@ void quantize_row_q_swq_hfit_4_128(const float * GGML_RESTRICT x, void * GGML_RE
     quantize_row_q_swq_hfit_4_128_ref(x, y, k);
 }
 
+void quantize_row_q_swq_plin3_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_plin3_128_ref(x, y, k);
+}
+
+void quantize_row_q_swq_plin4_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_plin4_128_ref(x, y, k);
+}
+
+void quantize_row_q_swq_plin3q_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_plin3q_128_ref(x, y, k);
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }
@@ -460,6 +472,115 @@ void ggml_vec_dot_q_swq_hfit_4_128_q8_0(int n, float * GGML_RESTRICT s, size_t b
             const float exact = GGML_CPU_FP16_TO_FP32(x[i].anchors[a]);
             const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_4_128 / QK8_0) + j / QK8_0;
             sum += (exact - predicted) * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+    }
+    *s = sum;
+}
+
+// Experimental PLIN x Q8_0 path. The line part uses segment sums instead of
+// reconstructing predicted weights one by one.
+void ggml_vec_dot_q_swq_plin3_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_PLIN3_128 == 0);
+    assert(QK_SWQ_PLIN3_128 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const block_q_swq_plin3_128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_PLIN3_128; ++i) {
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        float seg_sum[4] = { 0.0f };
+        float seg_isum[4] = { 0.0f };
+        float residual_dot = 0.0f;
+        for (int j = 0; j < QK_SWQ_PLIN3_128; ++j) {
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_PLIN3_128 / QK8_0) + j / QK8_0;
+            const float act = GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+            const int segment = j / 32;
+            const int local = j % 32;
+            seg_sum[segment] += act;
+            seg_isum[segment] += local * act;
+            residual_dot += residuals[swq_hfit_3_128_get_index_cpu(x[i].qs, j)] * act;
+        }
+        sum += residual_dot;
+        for (int segment = 0; segment < 4; ++segment) {
+            sum += GGML_CPU_FP16_TO_FP32(x[i].starts[segment]) * seg_sum[segment];
+            sum += GGML_CPU_FP16_TO_FP32(x[i].slopes[segment]) * seg_isum[segment];
+        }
+    }
+    *s = sum;
+}
+
+void ggml_vec_dot_q_swq_plin4_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_PLIN4_128 == 0);
+    assert(QK_SWQ_PLIN4_128 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const block_q_swq_plin4_128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_PLIN4_128; ++i) {
+        float residuals[16];
+        for (int c = 0; c < 16; ++c) {
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        float seg_sum[4] = { 0.0f };
+        float seg_isum[4] = { 0.0f };
+        float residual_dot = 0.0f;
+        for (int j = 0; j < QK_SWQ_PLIN4_128; ++j) {
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_PLIN4_128 / QK8_0) + j / QK8_0;
+            const float act = GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+            const int segment = j / 32;
+            const int local = j % 32;
+            const uint8_t q = (x[i].qs[j / 2] >> (4 * (j & 1))) & 0x0f;
+            seg_sum[segment] += act;
+            seg_isum[segment] += local * act;
+            residual_dot += residuals[q] * act;
+        }
+        sum += residual_dot;
+        for (int segment = 0; segment < 4; ++segment) {
+            sum += GGML_CPU_FP16_TO_FP32(x[i].starts[segment]) * seg_sum[segment];
+            sum += GGML_CPU_FP16_TO_FP32(x[i].slopes[segment]) * seg_isum[segment];
+        }
+    }
+    *s = sum;
+}
+
+void ggml_vec_dot_q_swq_plin3q_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_PLIN3Q_128 == 0);
+    assert(QK_SWQ_PLIN3Q_128 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const block_q_swq_plin3q_128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_PLIN3Q_128; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        float seg_sum[4] = { 0.0f };
+        float seg_isum[4] = { 0.0f };
+        float residual_dot = 0.0f;
+        for (int j = 0; j < QK_SWQ_PLIN3Q_128; ++j) {
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_PLIN3Q_128 / QK8_0) + j / QK8_0;
+            const float act = GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+            const int segment = j / 32;
+            const int local = j % 32;
+            seg_sum[segment] += act;
+            seg_isum[segment] += local * act;
+            residual_dot += residuals[swq_hfit_3_128_get_index_cpu(x[i].qs, j)] * act;
+        }
+        sum += residual_dot;
+        for (int segment = 0; segment < 4; ++segment) {
+            sum += d * x[i].coeffs[2 * segment] * seg_sum[segment];
+            sum += d * x[i].coeffs[2 * segment + 1] * seg_isum[segment];
         }
     }
     *s = sum;
