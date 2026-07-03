@@ -214,6 +214,42 @@ typedef struct {
 } block_q_swq_fit_3;
 static_assert(sizeof(block_q_swq_fit_3) == 12 * sizeof(ggml_half) + QK_SWQ_FIT_3 * 3 / 8, "wrong q_swq_fit_3 block size/padding");
 
+// Experimental hierarchical SWQ fit prototype: two INT8 cubics, shared residuals, and exact anchors.
+#define QK_SWQ_HFIT_3 256
+typedef struct {
+    ggml_half d;
+    ggml_half residuals[8];
+    ggml_half anchors[2];
+    int8_t coeffs[8];
+    uint8_t anchor_pos[2];
+    uint8_t qs[QK_SWQ_HFIT_3 * 3 / 8];
+} block_q_swq_hfit_3;
+static_assert(sizeof(block_q_swq_hfit_3) == 128, "wrong q_swq_hfit_3 block size/padding");
+
+// Experimental hierarchical SWQ fit prototype: row-compatible two INT8 cubics over 128 weights.
+#define QK_SWQ_HFIT_3_128 128
+typedef struct {
+    ggml_half d;
+    ggml_half residuals[8];
+    ggml_half anchors[2];
+    int8_t coeffs[8];
+    uint8_t anchor_pos[2];
+    uint8_t qs[QK_SWQ_HFIT_3_128 * 3 / 8];
+} block_q_swq_hfit_3_128;
+static_assert(sizeof(block_q_swq_hfit_3_128) == 80, "wrong q_swq_hfit_3_128 block size/padding");
+
+// Experimental hierarchical SWQ fit prototype: 4-bit residual indices for simpler CPU decoding.
+#define QK_SWQ_HFIT_4_128 128
+typedef struct {
+    ggml_half d;
+    ggml_half residuals[16];
+    ggml_half anchors[2];
+    int8_t coeffs[8];
+    uint8_t anchor_pos[2];
+    uint8_t qs[QK_SWQ_HFIT_4_128 / 2];
+} block_q_swq_hfit_4_128;
+static_assert(sizeof(block_q_swq_hfit_4_128) == 112, "wrong q_swq_hfit_4_128 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

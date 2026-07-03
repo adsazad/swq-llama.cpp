@@ -735,6 +735,66 @@ models/swq/conversion-q8-swq-fit-kv-e2-progress.log
 
 ## Current conclusions
 
+## Hierarchical INT8 FIT3-256 and exact-anchor experiment
+
+A separate offline design tested 256-weight groups containing two local
+128-weight cubic predictors, one shared eight-value residual codebook, INT8
+coefficients, and packed 3-bit residual indices. This preserves the local
+predictor span while sharing correction metadata.
+
+The 12x2 tensor-scale experiment produced:
+
+| Anchors per 256 weights | Estimated saved | Relative RMSE | Cosine |
+|---:|---:|---:|---:|
+| 0 | 76.56% | 0.134605 | 0.990899 |
+| 1 | 75.98% | 0.132332 | 0.991207 |
+| 2 | 75.39% | 0.130659 | 0.991432 |
+| 3 | 74.80% | 0.129236 | 0.991620 |
+
+Two anchors represent 0.78% of each block. Each anchor stores a one-byte
+position and exact FP16 value. Compared with the 128-weight offline FIT3 result
+of 0.169957 relative RMSE, the two-anchor result reduces reconstruction error
+while retaining an estimated rate just below 4 bpw.
+
+A self-contained per-block coefficient scale was then tested because normal
+GGML dot kernels cannot access tensor-level side scales. At 6x2:
+
+| Layout | Estimated saved | Relative RMSE | Cosine |
+|---|---:|---:|---:|
+| Per-block scale, no anchors | 76.17% | 0.137083 | 0.990560 |
+| Per-block scale, 2 anchors | 75.00% | 0.133266 | 0.991086 |
+
+The per-block, two-anchor layout is exactly 128 bytes per 256 weights, or 4.0
+bpw. The minimal `llama-quantize` and `llama-cli` build passed after adding an
+experimental runtime type.
+
+The runtime compatibility check exposed a blocking GGML row-layout constraint:
+
+```text
+Qwen matrix tensors:              170
+row width divisible by 256:        24
+row width not divisible by 256:   146
+dominant incompatible row width:  896
+```
+
+GGML quantized blocks cannot cross tensor rows. Therefore a standard 256-weight
+block would apply to only 24 matrices and force most Qwen matrices to another
+format. No full-model conversion was run because it would not represent the
+offline compression result. The next runtime design must either use a block
+size dividing both 896 and 4864, whose greatest common divisor is 128, or add a
+more invasive row-aware storage mechanism.
+
+Saved reports:
+
+```text
+models/swq/swq-hfit3-256-e6.html
+models/swq/swq-hfit3-256-e12.html
+models/swq/swq-hfit3-256-blockscale-e6.html
+models/swq/swq-hfit3-256-e6.csv
+models/swq/swq-hfit3-256-e12.csv
+models/swq/swq-hfit3-256-blockscale-e6.csv
+```
+
 The prototype works end to end on CPU and provides measurable file and RAM
 savings relative to FP16. Full SWQ128 gives strong compression, but scalar
 codebook lookup is too slow for generation on this CPU. Full `Q_SWQ_FIT_2`
@@ -746,6 +806,164 @@ broad SWQ use is unlikely to be fast enough.
 
 Perplexity, KL divergence, and direct Q4_K_M/Q8_0 benchmark runs have not yet
 been measured.
+
+## Runtime HFIT3-128 experiment
+
+`Q_SWQ_HFIT_3_128` was added as a row-compatible hierarchical FIT variant after
+the 256-weight design was blocked by Qwen row widths. The physical block is 128
+weights:
+
+- two 64-weight cubic predictors
+- one INT8 scale for the eight coefficients
+- eight INT8 cubic coefficients
+- eight FP16 residual codebook entries
+- two exact FP16 anchor values
+- 128 packed 3-bit residual indices
+
+The block size is 80 bytes, or 5.0 raw bits per weight.
+
+Build:
+
+```sh
+cmake --build build --target llama-quantize llama-cli llama-completion -j4
+```
+
+Conversion command:
+
+```sh
+./build/bin/llama-quantize \
+    --swq-stats \
+    --swq-fit-epochs 6 \
+    --swq-fit-residual-epochs 2 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-hfit-3-128-e6.gguf \
+    Q_SWQ_HFIT_3_128
+```
+
+Conversion result:
+
+| Metric | Value |
+|---|---:|
+| Model size before | 1202.09 MiB |
+| Quant size after | 432.64 MiB |
+| Quant BPW | 5.76 |
+| SWQ original tensor bytes | 1,260,477,952 |
+| SWQ tensor bytes | 453,655,040 |
+| SWQ compression ratio | 2.78x |
+| SWQ percentage saved | 64.01% |
+| Conversion time | 50.29 s |
+
+`output.weight` fell back to Q8_0, so this is not a fully HFIT3-128 file.
+Converted HFIT3-128 tensors individually reported 3.20x compression and 68.75%
+savings versus FP16 tensor bytes.
+
+Smoke command:
+
+```sh
+/usr/bin/time -l ./build/bin/llama-completion \
+    -m models/swq/qwen2.5-0.5b-instruct-q-swq-hfit-3-128-e6.gguf \
+    -p "The capital of India is" \
+    -n 16 \
+    -t 4 \
+    --temp 0 \
+    --no-display-prompt
+```
+
+Smoke result:
+
+| Model | Output | Max RSS | Prompt eval | Generation |
+|---|---|---:|---:|---:|
+| Q8_0 | `New Delhi` | 1,184,448,512 bytes | 70.46 t/s | 17.31 t/s |
+| HFIT3-128 e6 | `The capital of India is New Delhi.` | 676,708,352 bytes | 0.97 t/s | 0.87 t/s |
+
+Measured max RSS saving versus Q8_0 on this prompt was 507,740,160 bytes, about
+484 MiB. The quality on this one smoke prompt was correct. Runtime speed is not
+usable yet because the HFIT3-128 CPU dot path is scalar and reconstructs each
+weight through polynomial and residual lookup work.
+
+### Anchor correction moved out of the inner loop
+
+The first HFIT3-128 CPU dot loop checked both exact anchor positions for every
+weight:
+
+```text
+if current position is anchor 0, replace predicted weight
+if current position is anchor 1, replace predicted weight
+```
+
+That was replaced with a post-loop correction:
+
+```text
+dot += (exact_anchor - predicted_anchor) * activation_at_anchor
+```
+
+This keeps the same mathematical result while removing two branches per weight.
+
+Retest on the same HFIT3-128 e6 GGUF:
+
+| Variant | Output | Max RSS | Prompt eval | Generation | Instructions retired |
+|---|---|---:|---:|---:|---:|
+| Before anchor change | `The capital of India is New Delhi.` | 676,708,352 bytes | 0.97 t/s | 0.87 t/s | 410,776,567,430 |
+| After anchor correction | `The capital of India is New Delhi.` | 641,204,224 bytes | 1.00 t/s | 0.85 t/s | 385,398,740,793 |
+
+The branch removal reduced retired instructions by about 6%, but it did not
+materially improve tokens/sec. The remaining bottleneck is the scalar per-weight
+math: 3-bit unpack, cubic evaluation, residual lookup, and Q8 activation multiply.
+
+## Runtime HFIT4-128 experiment
+
+`Q_SWQ_HFIT_4_128` was added to test whether simpler 4-bit residual indices are
+faster than packed 3-bit indices. This format keeps the same row-compatible
+128-weight physical block and two 64-weight cubic predictors, but changes the
+residual path:
+
+- 16 FP16 residual codebook entries
+- 4-bit residual indices, packed two per byte
+- same two exact anchors as HFIT3-128
+- ARM NEON accumulation path for `Q_SWQ_HFIT_4_128 x Q8_0`
+
+The block size is 112 bytes, or 7.0 raw bits per weight. This is intentionally
+larger than HFIT3-128; the point of the test was speed and reconstruction quality,
+not maximum compression.
+
+Conversion command:
+
+```sh
+./build/bin/llama-quantize \
+    --swq-stats \
+    --swq-fit-epochs 6 \
+    --swq-fit-residual-epochs 2 \
+    models/swq/qwen2.5-0.5b-instruct-fp16.gguf \
+    models/swq/qwen2.5-0.5b-instruct-q-swq-hfit-4-128-e6.gguf \
+    Q_SWQ_HFIT_4_128
+```
+
+Conversion result:
+
+| Metric | Value |
+|---|---:|
+| Model size before | 1202.09 MiB |
+| Quant size after | 550.41 MiB |
+| Quant BPW | 7.33 |
+| SWQ original tensor bytes | 1,260,477,952 |
+| SWQ tensor bytes | 577,145,344 |
+| SWQ compression ratio | 2.18x |
+| SWQ percentage saved | 54.21% |
+| Conversion time | 50.13 s |
+
+Smoke result:
+
+| Model | File size | Output | Max RSS | Prompt eval | Generation | Instructions retired |
+|---|---:|---|---:|---:|---:|---:|
+| Q8_0 | 644 MB | `New Delhi` | 1,184,448,512 bytes | 70.46 t/s | 17.31 t/s | 14,703,410,751 |
+| HFIT3-128 e6 | 438 MB | `The capital of India is New Delhi.` | 641,204,224 bytes | 1.00 t/s | 0.85 t/s | 385,398,740,793 |
+| HFIT4-128 e6 | 556 MB | `New Delhi` | 775,307,264 bytes | 1.26 t/s | 1.08 t/s | 135,556,027,146 |
+
+HFIT4-128 improved speed and retired instructions versus HFIT3-128, but it is
+still far slower than Q8_0. It also gives up much of the RAM gain: the file is
+118 MB larger than HFIT3-128 and max RSS is about 128 MiB higher. The experiment
+shows that 4-bit indices help, but the dominant runtime cost is still computing
+equation-derived weights during the dot product.
 
 ## Raw logs
 

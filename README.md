@@ -106,6 +106,104 @@ same science prompt. A single coherent smoke response is therefore not enough
 to claim acceptable model quality; perplexity and a larger task evaluation are
 still required.
 
+`Q_SWQ_HFIT_3_128` is the row-compatible hierarchical FIT experiment. It was
+added after the 256-weight hierarchical idea compressed well offline but did not
+fit most Qwen rows cleanly. The physical block is 128 weights:
+
+```text
+128 weights represented by:
+  two 64-weight cubic predictors
+  one FP16 coefficient scale
+  eight INT8 equation coefficients
+  eight FP16 residual values
+  two exact FP16 anchors
+  128 packed 3-bit residual indices
+```
+
+This gives a raw block cost of 80 bytes per 128 weights, or about 5 bits per
+weight. On the Qwen test model, `Q_SWQ_HFIT_3_128` converted and loaded
+successfully, generated the correct smoke answer, and saved real RAM, but it was
+still too slow:
+
+| Model | File size | Peak RAM | Generation speed | Smoke output |
+|---|---:|---:|---:|---|
+| Q8_0 | 644 MB | 1,184,448,512 bytes | 17.31 t/s | `New Delhi` |
+| Q_SWQ_HFIT_3_128 | 438 MB | 641,204,224 bytes | 0.85 t/s | `The capital of India is New Delhi.` |
+
+`Q_SWQ_HFIT_3_128` conversion summary:
+
+```text
+SWQ original tensor bytes: 1,260,477,952
+SWQ tensor bytes:           453,655,040
+SWQ compression ratio:             2.78x
+SWQ percentage saved:             64.01%
+Quant size:                    432.64 MiB
+Quant BPW:                       5.76
+```
+
+The exact anchors were first checked inside every dot-product weight loop. That
+was changed to a post-loop correction:
+
+```text
+dot += (exact_anchor - predicted_anchor) * activation_at_anchor
+```
+
+This removed two per-weight branch checks and reduced retired instructions by
+about 6%, but generation speed stayed effectively unchanged. The dominant cost
+is still reconstructing every weight through cubic math, residual lookup, and
+activation multiply.
+
+`Q_SWQ_HFIT_4_128` is the 4-bit residual-index experiment. It keeps the same
+two-equation 128-weight block shape, but uses 16 residual values and 4-bit
+indices instead of 8 residual values and packed 3-bit indices. An ARM NEON
+accumulation path was added for `Q_SWQ_HFIT_4_128 x Q8_0`; polynomial
+reconstruction is still scalar.
+
+```text
+128 weights represented by:
+  two 64-weight cubic predictors
+  one FP16 coefficient scale
+  eight INT8 equation coefficients
+  sixteen FP16 residual values
+  two exact FP16 anchors
+  128 packed 4-bit residual indices
+```
+
+This gives a raw block cost of 112 bytes per 128 weights, or about 7 bits per
+weight. It improved speed versus HFIT3-128, but reduced compression:
+
+| Model | File size | Peak RAM | Generation speed | Smoke output |
+|---|---:|---:|---:|---|
+| Q8_0 | 644 MB | 1,184,448,512 bytes | 17.31 t/s | `New Delhi` |
+| Q_SWQ_HFIT_3_128 | 438 MB | 641,204,224 bytes | 0.85 t/s | `The capital of India is New Delhi.` |
+| Q_SWQ_HFIT_4_128 | 556 MB | 775,307,264 bytes | 1.08 t/s | `New Delhi` |
+
+`Q_SWQ_HFIT_4_128` conversion summary:
+
+```text
+SWQ original tensor bytes: 1,260,477,952
+SWQ tensor bytes:           577,145,344
+SWQ compression ratio:             2.18x
+SWQ percentage saved:             54.21%
+Quant size:                    550.41 MiB
+Quant BPW:                       7.33
+```
+
+The current research status is:
+
+```text
+Q_SWQ_4: compresses, loads, and runs, but full-model speed is too slow.
+Q_SWQ_FIT_2: very small, but too inaccurate.
+Q_SWQ_FIT_3: better quality, still too slow.
+Q_SWQ_HFIT_3_128: best RAM-saving runtime HFIT result, still too slow.
+Q_SWQ_HFIT_4_128: faster than HFIT3-128, but larger and still too slow.
+Q8_0 + selective SWQ128 K/V: current usable local tradeoff above 10 t/s.
+```
+
+The practical next direction is selective/hybrid quantization or a much more
+specialized kernel. Full equation-derived weights are not fast enough yet on
+this CPU path.
+
 An earlier attempt appeared to produce truncated responses because several
 `llama-cli` processes remained active after the command-output wrapper returned.
 Those results are not used above. The corrected measurements poll one process
@@ -145,6 +243,28 @@ Example `Q_SWQ_FIT_3` conversion command:
   Q_SWQ_FIT_3
 ```
 
+Example `Q_SWQ_HFIT_3_128` conversion command:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+  --swq-fit-epochs 6 \
+  --swq-fit-residual-epochs 2 \
+  model-f16.gguf \
+  model-q-swq-hfit-3-128.gguf \
+  Q_SWQ_HFIT_3_128
+```
+
+Example `Q_SWQ_HFIT_4_128` conversion command:
+
+```sh
+./build/bin/llama-quantize --swq-stats \
+  --swq-fit-epochs 6 \
+  --swq-fit-residual-epochs 2 \
+  model-f16.gguf \
+  model-q-swq-hfit-4-128.gguf \
+  Q_SWQ_HFIT_4_128
+```
+
 `--swq-fit-progress` prints per-tensor epoch stats such as RMSE and relative
 RMSE while converting.
 
@@ -166,6 +286,7 @@ Implementation notes and full findings are in:
 
 - `docs/development/SWQ.md`
 - `docs/development/SWQ-FINDINGS.md`
+- `docs/development/SWQ-RESEARCH-PAPER.md`
 
 ## Recent API changes
 

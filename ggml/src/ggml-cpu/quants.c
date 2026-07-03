@@ -42,6 +42,18 @@ void quantize_row_q_swq_fit_3(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     quantize_row_q_swq_fit_3_ref(x, y, k);
 }
 
+void quantize_row_q_swq_hfit_3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_hfit_3_ref(x, y, k);
+}
+
+void quantize_row_q_swq_hfit_3_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_hfit_3_128_ref(x, y, k);
+}
+
+void quantize_row_q_swq_hfit_4_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_swq_hfit_4_128_ref(x, y, k);
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }
@@ -270,6 +282,186 @@ void ggml_vec_dot_q_swq_fit_3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, co
         }
     }
 
+    *s = sum;
+}
+
+static uint8_t swq_hfit_3_get_index_cpu(const uint8_t qs[QK_SWQ_HFIT_3 * 3 / 8], int j) {
+    const int bit = 3 * j;
+    const int byte = bit / 8;
+    const int shift = bit % 8;
+    uint16_t value = qs[byte];
+    if (shift > 5) {
+        value |= (uint16_t) qs[byte + 1] << 8;
+    }
+    return (value >> shift) & 7;
+}
+
+// Experimental scalar hierarchical SWQ fit x Q8_0 path.
+void ggml_vec_dot_q_swq_hfit_3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_HFIT_3 == 0);
+    assert(QK_SWQ_HFIT_3 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const block_q_swq_hfit_3 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_HFIT_3; ++i) {
+        const float scale = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float coeffs[8];
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            coeffs[c] = scale * x[i].coeffs[c];
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_HFIT_3; ++j) {
+            const int segment = j / 128;
+            const int local = j % 128;
+            const float t = -1.0f + 2.0f * local / 127.0f;
+            const float * c = coeffs + 4 * segment;
+            float weight = c[0] + t * (c[1] + t * (c[2] + t * c[3]));
+            weight += residuals[swq_hfit_3_get_index_cpu(x[i].qs, j)];
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_3 / QK8_0) + j / QK8_0;
+            sum += weight * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+        for (int a = 0; a < 2; ++a) {
+            const int j = x[i].anchor_pos[a];
+            const int segment = j / 128;
+            const int local = j % 128;
+            const float t = -1.0f + 2.0f * local / 127.0f;
+            const float * c = coeffs + 4 * segment;
+            float predicted = c[0] + t * (c[1] + t * (c[2] + t * c[3]));
+            predicted += residuals[swq_hfit_3_get_index_cpu(x[i].qs, j)];
+            const float exact = GGML_CPU_FP16_TO_FP32(x[i].anchors[a]);
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_3 / QK8_0) + j / QK8_0;
+            sum += (exact - predicted) * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+    }
+    *s = sum;
+}
+
+static uint8_t swq_hfit_3_128_get_index_cpu(const uint8_t qs[QK_SWQ_HFIT_3_128 * 3 / 8], int j) {
+    const int bit = 3 * j;
+    const int byte = bit / 8;
+    const int shift = bit % 8;
+    uint16_t value = qs[byte];
+    if (shift > 5) {
+        value |= (uint16_t) qs[byte + 1] << 8;
+    }
+    return (value >> shift) & 7;
+}
+
+// Experimental scalar row-compatible hierarchical SWQ fit x Q8_0 path.
+void ggml_vec_dot_q_swq_hfit_3_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_HFIT_3_128 == 0);
+    assert(QK_SWQ_HFIT_3_128 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const block_q_swq_hfit_3_128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_HFIT_3_128; ++i) {
+        const float scale = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float coeffs[8];
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            coeffs[c] = scale * x[i].coeffs[c];
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_HFIT_3_128; ++j) {
+            const int segment = j / 64;
+            const int local = j % 64;
+            const float t = -1.0f + 2.0f * local / 63.0f;
+            const float * c = coeffs + 4 * segment;
+            float weight = c[0] + t * (c[1] + t * (c[2] + t * c[3]));
+            weight += residuals[swq_hfit_3_128_get_index_cpu(x[i].qs, j)];
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_3_128 / QK8_0) + j / QK8_0;
+            sum += weight * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+        for (int a = 0; a < 2; ++a) {
+            const int j = x[i].anchor_pos[a];
+            const int segment = j / 64;
+            const int local = j % 64;
+            const float t = -1.0f + 2.0f * local / 63.0f;
+            const float * c = coeffs + 4 * segment;
+            float predicted = c[0] + t * (c[1] + t * (c[2] + t * c[3]));
+            predicted += residuals[swq_hfit_3_128_get_index_cpu(x[i].qs, j)];
+            const float exact = GGML_CPU_FP16_TO_FP32(x[i].anchors[a]);
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_3_128 / QK8_0) + j / QK8_0;
+            sum += (exact - predicted) * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+    }
+    *s = sum;
+}
+
+// Experimental 4-bit HFIT x Q8_0 path. On ARM this uses NEON for the accumulation
+// after nibble decode; polynomial reconstruction is still scalar.
+void ggml_vec_dot_q_swq_hfit_4_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_SWQ_HFIT_4_128 == 0);
+    assert(QK_SWQ_HFIT_4_128 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const block_q_swq_hfit_4_128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_SWQ_HFIT_4_128; ++i) {
+        const float scale = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float coeffs[8];
+        float residuals[16];
+        for (int c = 0; c < 8; ++c) {
+            coeffs[c] = scale * x[i].coeffs[c];
+        }
+        for (int c = 0; c < 16; ++c) {
+            residuals[c] = GGML_CPU_FP16_TO_FP32(x[i].residuals[c]);
+        }
+
+#if defined(__ARM_NEON)
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int j = 0; j < QK_SWQ_HFIT_4_128; j += 4) {
+            float weights[4];
+            float acts[4];
+            for (int r = 0; r < 4; ++r) {
+                const int p = j + r;
+                const int segment = p / 64;
+                const int local = p % 64;
+                const float t = -1.0f + 2.0f * local / 63.0f;
+                const float * c = coeffs + 4 * segment;
+                const uint8_t packed = x[i].qs[p / 2];
+                const uint8_t q = (packed >> (4 * (p & 1))) & 0x0f;
+                weights[r] = c[0] + t * (c[1] + t * (c[2] + t * c[3])) + residuals[q];
+                const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_4_128 / QK8_0) + p / QK8_0;
+                acts[r] = GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[p % QK8_0];
+            }
+            acc = vmlaq_f32(acc, vld1q_f32(weights), vld1q_f32(acts));
+        }
+        sum += vaddvq_f32(acc);
+#else
+        for (int j = 0; j < QK_SWQ_HFIT_4_128; ++j) {
+            const int segment = j / 64;
+            const int local = j % 64;
+            const float t = -1.0f + 2.0f * local / 63.0f;
+            const float * c = coeffs + 4 * segment;
+            const uint8_t q = (x[i].qs[j / 2] >> (4 * (j & 1))) & 0x0f;
+            const float weight = c[0] + t * (c[1] + t * (c[2] + t * c[3])) + residuals[q];
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_4_128 / QK8_0) + j / QK8_0;
+            sum += weight * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+#endif
+        for (int a = 0; a < 2; ++a) {
+            const int j = x[i].anchor_pos[a];
+            const int segment = j / 64;
+            const int local = j % 64;
+            const float t = -1.0f + 2.0f * local / 63.0f;
+            const float * c = coeffs + 4 * segment;
+            const uint8_t q = (x[i].qs[j / 2] >> (4 * (j & 1))) & 0x0f;
+            const float predicted = c[0] + t * (c[1] + t * (c[2] + t * c[3])) + residuals[q];
+            const float exact = GGML_CPU_FP16_TO_FP32(x[i].anchors[a]);
+            const block_q8_0 * GGML_RESTRICT yb = y + i * (QK_SWQ_HFIT_4_128 / QK8_0) + j / QK8_0;
+            sum += (exact - predicted) * GGML_CPU_FP16_TO_FP32(yb->d) * yb->qs[j % QK8_0];
+        }
+    }
     *s = sum;
 }
 

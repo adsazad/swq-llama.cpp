@@ -432,7 +432,10 @@ extern "C" {
         GGML_TYPE_Q_SWQ_4 = 42, // experimental: per-block FP16 codebook with 4-bit indices
         GGML_TYPE_Q_SWQ_FIT_2 = 43, // experimental: cubic fit plus 2-bit residuals
         GGML_TYPE_Q_SWQ_FIT_3 = 44, // experimental: cubic fit plus 3-bit residuals
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_Q_SWQ_HFIT_3 = 45, // experimental: hierarchical INT8 cubic fit plus anchors
+        GGML_TYPE_Q_SWQ_HFIT_3_128 = 46, // experimental: row-compatible hierarchical INT8 cubic fit
+        GGML_TYPE_Q_SWQ_HFIT_4_128 = 47, // experimental: 4-bit hierarchical INT8 cubic fit
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision
@@ -479,6 +482,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q_SWQ_4 = 28, // experimental, except 1d tensors
         GGML_FTYPE_MOSTLY_Q_SWQ_FIT_2 = 29, // experimental, except 1d tensors
         GGML_FTYPE_MOSTLY_Q_SWQ_FIT_3 = 30, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_HFIT_3 = 31, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_HFIT_3_128 = 32, // experimental, except 1d tensors
+        GGML_FTYPE_MOSTLY_Q_SWQ_HFIT_4_128 = 33, // experimental, except 1d tensors
     };
 
     // available tensor operations:

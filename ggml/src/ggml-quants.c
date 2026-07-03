@@ -552,6 +552,408 @@ void quantize_row_q_swq_fit_3_ref(const float * GGML_RESTRICT x, block_q_swq_fit
     }
 }
 
+static float swq_hfit_3_eval(const float coeffs[8], int j) {
+    const int segment = j / 128;
+    const int local = j % 128;
+    const float t = -1.0f + 2.0f * local / 127.0f;
+    const float * c = coeffs + 4 * segment;
+    return c[0] + t * (c[1] + t * (c[2] + t * c[3]));
+}
+
+static void swq_hfit_3_fit_coeffs(const float * xb, const uint8_t * indices, const float codebook[8], float coeffs[8]) {
+    for (int segment = 0; segment < 2; ++segment) {
+        float normal[4][5] = { { 0.0f } };
+        float mean = 0.0f;
+        for (int local = 0; local < 128; ++local) {
+            const int j = 128 * segment + local;
+            const float correction = indices ? codebook[indices[j]] : 0.0f;
+            const float target = xb[j] - correction;
+            const float t = -1.0f + 2.0f * local / 127.0f;
+            const float p[4] = { 1.0f, t, t * t, t * t * t };
+            mean += target;
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    normal[r][c] += p[r] * p[c];
+                }
+                normal[r][4] += p[r] * target;
+            }
+        }
+        if (!swq_fit_2_solve(normal, coeffs + 4 * segment)) {
+            coeffs[4 * segment] = mean / 128.0f;
+            coeffs[4 * segment + 1] = 0.0f;
+            coeffs[4 * segment + 2] = 0.0f;
+            coeffs[4 * segment + 3] = 0.0f;
+        }
+    }
+}
+
+static float swq_hfit_3_quantize_coeffs(float coeffs[8], int8_t quantized[8]) {
+    float max_abs = 0.0f;
+    for (int c = 0; c < 8; ++c) {
+        max_abs = MAX(max_abs, fabsf(coeffs[c]));
+    }
+    const float d = max_abs > 0.0f ? max_abs / 127.0f : 0.0f;
+    for (int c = 0; c < 8; ++c) {
+        const int q = d > 0.0f ? (int) roundf(coeffs[c] / d) : 0;
+        quantized[c] = (int8_t) MAX(-127, MIN(127, q));
+        coeffs[c] = d * quantized[c];
+    }
+    return d;
+}
+
+static void swq_hfit_3_assign_residuals(const float * xb, const float coeffs[8], float codebook[8], uint8_t indices[QK_SWQ_HFIT_3]) {
+    float sums[8] = { 0.0f };
+    int counts[8] = { 0 };
+    for (int j = 0; j < QK_SWQ_HFIT_3; ++j) {
+        const float residual = xb[j] - swq_hfit_3_eval(coeffs, j);
+        int best = 0;
+        float best_error = fabsf(residual - codebook[0]);
+        for (int c = 1; c < 8; ++c) {
+            const float error = fabsf(residual - codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        indices[j] = best;
+        sums[best] += residual;
+        counts[best]++;
+    }
+    for (int c = 0; c < 8; ++c) {
+        if (counts[c] > 0) {
+            codebook[c] = sums[c] / counts[c];
+        }
+    }
+}
+
+static void swq_hfit_3_pack_indices(const uint8_t indices[QK_SWQ_HFIT_3], uint8_t qs[QK_SWQ_HFIT_3 * 3 / 8]) {
+    memset(qs, 0, QK_SWQ_HFIT_3 * 3 / 8);
+    for (int j = 0; j < QK_SWQ_HFIT_3; ++j) {
+        const int bit = 3 * j;
+        const int byte = bit / 8;
+        const int shift = bit % 8;
+        const uint16_t value = (uint16_t) (indices[j] & 7) << shift;
+        qs[byte] |= value & 0xff;
+        if (shift > 5) {
+            qs[byte + 1] |= value >> 8;
+        }
+    }
+}
+
+static uint8_t swq_hfit_3_get_index(const uint8_t qs[QK_SWQ_HFIT_3 * 3 / 8], int j) {
+    const int bit = 3 * j;
+    const int byte = bit / 8;
+    const int shift = bit % 8;
+    uint16_t value = qs[byte];
+    if (shift > 5) {
+        value |= (uint16_t) qs[byte + 1] << 8;
+    }
+    return (value >> shift) & 7;
+}
+
+// Experimental hierarchical SWQ: two INT8 cubics, shared 3-bit residuals, and two exact anchors.
+void quantize_row_q_swq_hfit_3_ref(const float * GGML_RESTRICT x, block_q_swq_hfit_3 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_HFIT_3 == 0);
+    const int nb = k / QK_SWQ_HFIT_3;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_HFIT_3;
+        float coeffs[8] = { 0.0f };
+        float codebook[8];
+        uint8_t indices[QK_SWQ_HFIT_3] = { 0 };
+        int8_t quantized_coeffs[8];
+        swq_hfit_3_fit_coeffs(xb, NULL, NULL, coeffs);
+        swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+
+        float min = xb[0] - swq_hfit_3_eval(coeffs, 0);
+        float max = min;
+        for (int j = 1; j < QK_SWQ_HFIT_3; ++j) {
+            const float residual = xb[j] - swq_hfit_3_eval(coeffs, j);
+            min = MIN(min, residual);
+            max = MAX(max, residual);
+        }
+        for (int c = 0; c < 8; ++c) {
+            codebook[c] = min + (max - min) * c / 7.0f;
+        }
+
+        for (int epoch = 0; epoch < g_swq_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < g_swq_fit_residual_epochs; ++iteration) {
+                swq_hfit_3_assign_residuals(xb, coeffs, codebook, indices);
+            }
+            swq_hfit_3_fit_coeffs(xb, indices, codebook, coeffs);
+            swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+        }
+        swq_hfit_3_assign_residuals(xb, coeffs, codebook, indices);
+
+        const float d = swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int c = 0; c < 8; ++c) {
+            y[i].coeffs[c] = quantized_coeffs[c];
+            y[i].residuals[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        swq_hfit_3_pack_indices(indices, y[i].qs);
+
+        float worst_error[2] = { -1.0f, -1.0f };
+        int worst_pos[2] = { 0, 1 };
+        for (int j = 0; j < QK_SWQ_HFIT_3; ++j) {
+            const float reconstructed = swq_hfit_3_eval(coeffs, j) + codebook[indices[j]];
+            const float error = fabsf(xb[j] - reconstructed);
+            if (error > worst_error[0]) {
+                worst_error[1] = worst_error[0];
+                worst_pos[1] = worst_pos[0];
+                worst_error[0] = error;
+                worst_pos[0] = j;
+            } else if (error > worst_error[1]) {
+                worst_error[1] = error;
+                worst_pos[1] = j;
+            }
+        }
+        for (int anchor = 0; anchor < 2; ++anchor) {
+            y[i].anchor_pos[anchor] = worst_pos[anchor];
+            y[i].anchors[anchor] = GGML_FP32_TO_FP16(xb[worst_pos[anchor]]);
+        }
+    }
+}
+
+static float swq_hfit_3_128_eval(const float coeffs[8], int j) {
+    const int segment = j / 64;
+    const int local = j % 64;
+    const float t = -1.0f + 2.0f * local / 63.0f;
+    const float * c = coeffs + 4 * segment;
+    return c[0] + t * (c[1] + t * (c[2] + t * c[3]));
+}
+
+static void swq_hfit_3_128_fit_coeffs(const float * xb, const uint8_t * indices, const float codebook[8], float coeffs[8]) {
+    for (int segment = 0; segment < 2; ++segment) {
+        float normal[4][5] = { { 0.0f } };
+        float mean = 0.0f;
+        for (int local = 0; local < 64; ++local) {
+            const int j = 64 * segment + local;
+            const float correction = indices ? codebook[indices[j]] : 0.0f;
+            const float target = xb[j] - correction;
+            const float t = -1.0f + 2.0f * local / 63.0f;
+            const float p[4] = { 1.0f, t, t * t, t * t * t };
+            mean += target;
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    normal[r][c] += p[r] * p[c];
+                }
+                normal[r][4] += p[r] * target;
+            }
+        }
+        if (!swq_fit_2_solve(normal, coeffs + 4 * segment)) {
+            coeffs[4 * segment] = mean / 64.0f;
+            coeffs[4 * segment + 1] = 0.0f;
+            coeffs[4 * segment + 2] = 0.0f;
+            coeffs[4 * segment + 3] = 0.0f;
+        }
+    }
+}
+
+static void swq_hfit_3_128_assign_residuals(const float * xb, const float coeffs[8], float codebook[8], uint8_t indices[QK_SWQ_HFIT_3_128]) {
+    float sums[8] = { 0.0f };
+    int counts[8] = { 0 };
+    for (int j = 0; j < QK_SWQ_HFIT_3_128; ++j) {
+        const float residual = xb[j] - swq_hfit_3_128_eval(coeffs, j);
+        int best = 0;
+        float best_error = fabsf(residual - codebook[0]);
+        for (int c = 1; c < 8; ++c) {
+            const float error = fabsf(residual - codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        indices[j] = best;
+        sums[best] += residual;
+        counts[best]++;
+    }
+    for (int c = 0; c < 8; ++c) {
+        if (counts[c] > 0) {
+            codebook[c] = sums[c] / counts[c];
+        }
+    }
+}
+
+static void swq_hfit_3_128_pack_indices(const uint8_t indices[QK_SWQ_HFIT_3_128], uint8_t qs[QK_SWQ_HFIT_3_128 * 3 / 8]) {
+    memset(qs, 0, QK_SWQ_HFIT_3_128 * 3 / 8);
+    for (int j = 0; j < QK_SWQ_HFIT_3_128; ++j) {
+        const int bit = 3 * j;
+        const int byte = bit / 8;
+        const int shift = bit % 8;
+        const uint16_t value = (uint16_t) (indices[j] & 7) << shift;
+        qs[byte] |= value & 0xff;
+        if (shift > 5) {
+            qs[byte + 1] |= value >> 8;
+        }
+    }
+}
+
+static uint8_t swq_hfit_3_128_get_index(const uint8_t qs[QK_SWQ_HFIT_3_128 * 3 / 8], int j) {
+    const int bit = 3 * j;
+    const int byte = bit / 8;
+    const int shift = bit % 8;
+    uint16_t value = qs[byte];
+    if (shift > 5) {
+        value |= (uint16_t) qs[byte + 1] << 8;
+    }
+    return (value >> shift) & 7;
+}
+
+// Experimental row-compatible hierarchical SWQ: two INT8 cubics over 128 weights.
+void quantize_row_q_swq_hfit_3_128_ref(const float * GGML_RESTRICT x, block_q_swq_hfit_3_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_HFIT_3_128 == 0);
+    const int nb = k / QK_SWQ_HFIT_3_128;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_HFIT_3_128;
+        float coeffs[8] = { 0.0f };
+        float codebook[8];
+        uint8_t indices[QK_SWQ_HFIT_3_128] = { 0 };
+        int8_t quantized_coeffs[8];
+        swq_hfit_3_128_fit_coeffs(xb, NULL, NULL, coeffs);
+        swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+
+        float min = xb[0] - swq_hfit_3_128_eval(coeffs, 0);
+        float max = min;
+        for (int j = 1; j < QK_SWQ_HFIT_3_128; ++j) {
+            const float residual = xb[j] - swq_hfit_3_128_eval(coeffs, j);
+            min = MIN(min, residual);
+            max = MAX(max, residual);
+        }
+        for (int c = 0; c < 8; ++c) {
+            codebook[c] = min + (max - min) * c / 7.0f;
+        }
+
+        for (int epoch = 0; epoch < g_swq_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < g_swq_fit_residual_epochs; ++iteration) {
+                swq_hfit_3_128_assign_residuals(xb, coeffs, codebook, indices);
+            }
+            swq_hfit_3_128_fit_coeffs(xb, indices, codebook, coeffs);
+            swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+        }
+        swq_hfit_3_128_assign_residuals(xb, coeffs, codebook, indices);
+
+        const float d = swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int c = 0; c < 8; ++c) {
+            y[i].coeffs[c] = quantized_coeffs[c];
+            y[i].residuals[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        swq_hfit_3_128_pack_indices(indices, y[i].qs);
+
+        float worst_error[2] = { -1.0f, -1.0f };
+        int worst_pos[2] = { 0, 1 };
+        for (int j = 0; j < QK_SWQ_HFIT_3_128; ++j) {
+            const float reconstructed = swq_hfit_3_128_eval(coeffs, j) + codebook[indices[j]];
+            const float error = fabsf(xb[j] - reconstructed);
+            if (error > worst_error[0]) {
+                worst_error[1] = worst_error[0];
+                worst_pos[1] = worst_pos[0];
+                worst_error[0] = error;
+                worst_pos[0] = j;
+            } else if (error > worst_error[1]) {
+                worst_error[1] = error;
+                worst_pos[1] = j;
+            }
+        }
+        for (int anchor = 0; anchor < 2; ++anchor) {
+            y[i].anchor_pos[anchor] = worst_pos[anchor];
+            y[i].anchors[anchor] = GGML_FP32_TO_FP16(xb[worst_pos[anchor]]);
+        }
+    }
+}
+
+static void swq_hfit_4_128_assign_residuals(const float * xb, const float coeffs[8], float codebook[16], uint8_t indices[QK_SWQ_HFIT_4_128]) {
+    float sums[16] = { 0.0f };
+    int counts[16] = { 0 };
+    for (int j = 0; j < QK_SWQ_HFIT_4_128; ++j) {
+        const float residual = xb[j] - swq_hfit_3_128_eval(coeffs, j);
+        int best = 0;
+        float best_error = fabsf(residual - codebook[0]);
+        for (int c = 1; c < 16; ++c) {
+            const float error = fabsf(residual - codebook[c]);
+            if (error < best_error) {
+                best = c;
+                best_error = error;
+            }
+        }
+        indices[j] = best;
+        sums[best] += residual;
+        counts[best]++;
+    }
+    for (int c = 0; c < 16; ++c) {
+        if (counts[c] > 0) {
+            codebook[c] = sums[c] / counts[c];
+        }
+    }
+}
+
+// Experimental row-compatible hierarchical SWQ: two INT8 cubics with 4-bit residual indices.
+void quantize_row_q_swq_hfit_4_128_ref(const float * GGML_RESTRICT x, block_q_swq_hfit_4_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_HFIT_4_128 == 0);
+    const int nb = k / QK_SWQ_HFIT_4_128;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_SWQ_HFIT_4_128;
+        float coeffs[8] = { 0.0f };
+        float codebook[16];
+        uint8_t indices[QK_SWQ_HFIT_4_128] = { 0 };
+        int8_t quantized_coeffs[8];
+        swq_hfit_3_128_fit_coeffs(xb, NULL, NULL, coeffs);
+        swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+
+        float min = xb[0] - swq_hfit_3_128_eval(coeffs, 0);
+        float max = min;
+        for (int j = 1; j < QK_SWQ_HFIT_4_128; ++j) {
+            const float residual = xb[j] - swq_hfit_3_128_eval(coeffs, j);
+            min = MIN(min, residual);
+            max = MAX(max, residual);
+        }
+        for (int c = 0; c < 16; ++c) {
+            codebook[c] = min + (max - min) * c / 15.0f;
+        }
+
+        for (int epoch = 0; epoch < g_swq_fit_epochs; ++epoch) {
+            for (int iteration = 0; iteration < g_swq_fit_residual_epochs; ++iteration) {
+                swq_hfit_4_128_assign_residuals(xb, coeffs, codebook, indices);
+            }
+            swq_hfit_3_128_fit_coeffs(xb, indices, codebook, coeffs);
+            swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+        }
+        swq_hfit_4_128_assign_residuals(xb, coeffs, codebook, indices);
+
+        const float d = swq_hfit_3_quantize_coeffs(coeffs, quantized_coeffs);
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int c = 0; c < 8; ++c) {
+            y[i].coeffs[c] = quantized_coeffs[c];
+        }
+        for (int c = 0; c < 16; ++c) {
+            y[i].residuals[c] = GGML_FP32_TO_FP16(codebook[c]);
+        }
+        for (int j = 0; j < QK_SWQ_HFIT_4_128 / 2; ++j) {
+            y[i].qs[j] = (indices[2 * j] & 0x0f) | ((indices[2 * j + 1] & 0x0f) << 4);
+        }
+
+        float worst_error[2] = { -1.0f, -1.0f };
+        int worst_pos[2] = { 0, 1 };
+        for (int j = 0; j < QK_SWQ_HFIT_4_128; ++j) {
+            const float reconstructed = swq_hfit_3_128_eval(coeffs, j) + codebook[indices[j]];
+            const float error = fabsf(xb[j] - reconstructed);
+            if (error > worst_error[0]) {
+                worst_error[1] = worst_error[0];
+                worst_pos[1] = worst_pos[0];
+                worst_error[0] = error;
+                worst_pos[0] = j;
+            } else if (error > worst_error[1]) {
+                worst_error[1] = error;
+                worst_pos[1] = j;
+            }
+        }
+        for (int anchor = 0; anchor < 2; ++anchor) {
+            y[i].anchor_pos[anchor] = worst_pos[anchor];
+            y[i].anchors[anchor] = GGML_FP32_TO_FP16(xb[worst_pos[anchor]]);
+        }
+    }
+}
+
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
     const int qk = QK4_1;
 
@@ -907,6 +1309,71 @@ void dequantize_row_q_swq_fit_3(const block_q_swq_fit_3 * GGML_RESTRICT x, float
         for (int j = 0; j < QK_SWQ_FIT_3; ++j) {
             const uint8_t q = swq_fit_3_get_index(x[i].qs, j);
             y[i * QK_SWQ_FIT_3 + j] = swq_fit_3_eval(coeffs, j) + residuals[q];
+        }
+    }
+}
+
+void dequantize_row_q_swq_hfit_3(const block_q_swq_hfit_3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_HFIT_3 == 0);
+    const int nb = k / QK_SWQ_HFIT_3;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float coeffs[8];
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            coeffs[c] = d * x[i].coeffs[c];
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_HFIT_3; ++j) {
+            const uint8_t q = swq_hfit_3_get_index(x[i].qs, j);
+            y[i * QK_SWQ_HFIT_3 + j] = swq_hfit_3_eval(coeffs, j) + residuals[q];
+        }
+        for (int anchor = 0; anchor < 2; ++anchor) {
+            y[i * QK_SWQ_HFIT_3 + x[i].anchor_pos[anchor]] = GGML_FP16_TO_FP32(x[i].anchors[anchor]);
+        }
+    }
+}
+
+void dequantize_row_q_swq_hfit_3_128(const block_q_swq_hfit_3_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_HFIT_3_128 == 0);
+    const int nb = k / QK_SWQ_HFIT_3_128;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float coeffs[8];
+        float residuals[8];
+        for (int c = 0; c < 8; ++c) {
+            coeffs[c] = d * x[i].coeffs[c];
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_HFIT_3_128; ++j) {
+            const uint8_t q = swq_hfit_3_128_get_index(x[i].qs, j);
+            y[i * QK_SWQ_HFIT_3_128 + j] = swq_hfit_3_128_eval(coeffs, j) + residuals[q];
+        }
+        for (int anchor = 0; anchor < 2; ++anchor) {
+            y[i * QK_SWQ_HFIT_3_128 + x[i].anchor_pos[anchor]] = GGML_FP16_TO_FP32(x[i].anchors[anchor]);
+        }
+    }
+}
+
+void dequantize_row_q_swq_hfit_4_128(const block_q_swq_hfit_4_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SWQ_HFIT_4_128 == 0);
+    const int nb = k / QK_SWQ_HFIT_4_128;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float coeffs[8];
+        float residuals[16];
+        for (int c = 0; c < 8; ++c) {
+            coeffs[c] = d * x[i].coeffs[c];
+        }
+        for (int c = 0; c < 16; ++c) {
+            residuals[c] = GGML_FP16_TO_FP32(x[i].residuals[c]);
+        }
+        for (int j = 0; j < QK_SWQ_HFIT_4_128; ++j) {
+            const uint8_t q = (x[i].qs[j / 2] >> (4 * (j & 1))) & 0x0f;
+            y[i * QK_SWQ_HFIT_4_128 + j] = swq_hfit_3_128_eval(coeffs, j) + residuals[q];
+        }
+        for (int anchor = 0; anchor < 2; ++anchor) {
+            y[i * QK_SWQ_HFIT_4_128 + x[i].anchor_pos[anchor]] = GGML_FP16_TO_FP32(x[i].anchors[anchor]);
         }
     }
 }
@@ -2577,6 +3044,24 @@ size_t quantize_q_swq_fit_3(const float * GGML_RESTRICT src, void * GGML_RESTRIC
     GGML_UNUSED(quant_weights);
     quantize_row_q_swq_fit_3_ref(src, dst, nrow * n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_FIT_3, n_per_row);
+}
+
+size_t quantize_q_swq_hfit_3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_hfit_3_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_HFIT_3, n_per_row);
+}
+
+size_t quantize_q_swq_hfit_3_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_hfit_3_128_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_HFIT_3_128, n_per_row);
+}
+
+size_t quantize_q_swq_hfit_4_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q_swq_hfit_4_128_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_SWQ_HFIT_4_128, n_per_row);
 }
 
 static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
@@ -6009,6 +6494,63 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                     }
                     for (size_t j = 0; j < 8; ++j) {
                         if (!validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_HFIT_3:
+            {
+                const block_q_swq_hfit_3 * q = (const block_q_swq_hfit_3 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i)) {
+                        return false;
+                    }
+                    for (size_t j = 0; j < 8; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < 2; ++j) {
+                        if (!validate_fp16(q[i].anchors[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_HFIT_3_128:
+            {
+                const block_q_swq_hfit_3_128 * q = (const block_q_swq_hfit_3_128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i)) {
+                        return false;
+                    }
+                    for (size_t j = 0; j < 8; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < 2; ++j) {
+                        if (!validate_fp16(q[i].anchors[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q_SWQ_HFIT_4_128:
+            {
+                const block_q_swq_hfit_4_128 * q = (const block_q_swq_hfit_4_128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i)) {
+                        return false;
+                    }
+                    for (size_t j = 0; j < 16; ++j) {
+                        if (!validate_fp16(q[i].residuals[j], i)) {
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < 2; ++j) {
+                        if (!validate_fp16(q[i].anchors[j], i)) {
                             return false;
                         }
                     }

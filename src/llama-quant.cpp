@@ -804,6 +804,9 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q_SWQ_4: return GGML_TYPE_Q_SWQ_4;
         case LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_2: return GGML_TYPE_Q_SWQ_FIT_2;
         case LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_3: return GGML_TYPE_Q_SWQ_FIT_3;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3: return GGML_TYPE_Q_SWQ_HFIT_3;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3_128: return GGML_TYPE_Q_SWQ_HFIT_3_128;
+        case LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_4_128: return GGML_TYPE_Q_SWQ_HFIT_4_128;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
@@ -1074,7 +1077,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     size_t total_size_org = 0;
     size_t total_size_new = 0;
     auto print_swq_tensor_stats = [params](const ggml_tensor * tensor, ggml_type new_type, size_t original, size_t compressed) {
-        if (!params->swq_stats || (new_type != GGML_TYPE_Q_SWQ_4 && new_type != GGML_TYPE_Q_SWQ_FIT_2 && new_type != GGML_TYPE_Q_SWQ_FIT_3)) {
+        if (!params->swq_stats || (new_type != GGML_TYPE_Q_SWQ_4 && new_type != GGML_TYPE_Q_SWQ_FIT_2 && new_type != GGML_TYPE_Q_SWQ_FIT_3 && new_type != GGML_TYPE_Q_SWQ_HFIT_3 && new_type != GGML_TYPE_Q_SWQ_HFIT_3_128 && new_type != GGML_TYPE_Q_SWQ_HFIT_4_128)) {
             return;
         }
         const size_t saved = original - compressed;
@@ -1252,10 +1255,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
-                const int64_t nthread_use = params->swq_fit_progress && (new_type == GGML_TYPE_Q_SWQ_FIT_2 || new_type == GGML_TYPE_Q_SWQ_FIT_3) ?
+                const int64_t nthread_use = params->swq_fit_progress && (new_type == GGML_TYPE_Q_SWQ_FIT_2 || new_type == GGML_TYPE_Q_SWQ_FIT_3 || new_type == GGML_TYPE_Q_SWQ_HFIT_3 || new_type == GGML_TYPE_Q_SWQ_HFIT_3_128 || new_type == GGML_TYPE_Q_SWQ_HFIT_4_128) ?
                     1 : (nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1);
 
-                if (new_type == GGML_TYPE_Q_SWQ_FIT_2 || new_type == GGML_TYPE_Q_SWQ_FIT_3) {
+                if (new_type == GGML_TYPE_Q_SWQ_FIT_2 || new_type == GGML_TYPE_Q_SWQ_FIT_3 || new_type == GGML_TYPE_Q_SWQ_HFIT_3 || new_type == GGML_TYPE_Q_SWQ_HFIT_3_128 || new_type == GGML_TYPE_Q_SWQ_HFIT_4_128) {
                     ggml_quantize_swq_fit_set_tensor_name(tensor->name);
                 }
 
@@ -1291,7 +1294,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
-    if (params->swq_stats && (params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_4 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_2 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_3)) {
+    if (params->swq_stats && (params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_4 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_2 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_FIT_3 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_3_128 || params->ftype == LLAMA_FTYPE_MOSTLY_Q_SWQ_HFIT_4_128)) {
         const size_t saved = total_size_org - total_size_new;
         LLAMA_LOG_INFO("SWQ original tensor bytes: %zu\n", total_size_org);
         LLAMA_LOG_INFO("SWQ tensor bytes: %zu\n", total_size_new);
